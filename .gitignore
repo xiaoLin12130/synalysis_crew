@@ -1,0 +1,19 @@
+# 真实交割单（隐私，绝不提交）
+data/*.xlsx
+data/*.xls
+data/*.csv
+
+# 环境变量与密钥
+.env
+
+# 输出与缓存
+output/
+__pycache__/
+*.pyc
+.venv/
+.tmp/
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
