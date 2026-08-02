@@ -70,12 +70,25 @@ _METRIC_LABELS = [
     ("top5_concentration", "Top5 集中度"),
     ("monthly_activity", "月度交易活跃度"),
     ("style", "风格初判"),
+    # 与 metrics.py 实际 Schema 对齐的键名（嵌套结构，如 account.total_return_rate）
+    ("start_date", "统计起始"),
+    ("end_date", "统计截止"),
+    ("annualized_return_rate", "年化收益率"),
+    ("total_cost_ratio", "交易成本占比"),
+    ("total_amount", "总成交金额"),
+    ("total_count", "总笔数"),
+    ("daily_avg_count", "日均交易笔数"),
+    ("distinct_stock_count", "交易股票数"),
+    ("current_holding_count", "期末持仓只数"),
+    ("avg_trade_amount", "平均单笔金额"),
+    ("capital_turnover_rate", "资金周转率"),
+    ("avg_holding_period_days", "平均持仓周期"),
 ]
 
 # 百分比类键（格式化时转成 %）
 _PCT_KEYS = (
     "return", "annual", "win", "drawdown", "turnover", "ratio",
-    "收益率", "年化", "胜率", "回撤", "周转", "盈亏比", "占比",
+    "收益率", "年化", "胜率", "回撤", "周转", "盈亏比", "占比", "集中度",
 )
 
 
@@ -159,13 +172,11 @@ def _fmt_num(v) -> str:
 
 
 def _fmt_pct(v) -> str:
-    """数值按百分比展示；已是字符串则原样返回。"""
+    """数值按百分比展示（Schema 约定比率以小数存储，0.1234 = 12.34%）；已是字符串则原样返回。"""
     if isinstance(v, bool):
         return str(v)
     if isinstance(v, (int, float)):
-        if -1 <= v <= 1:
-            return f"{v * 100:.1f}%"
-        return f"{v:.2f}"
+        return f"{v * 100:.1f}%"
     s = str(v)
     return s if s.endswith("%") else s
 
@@ -269,7 +280,7 @@ def _metrics_allowed(key: str) -> bool:
         "turnover", "trade", "cost", "fee", "stock", "double", "halv", "style",
         "monthly", "concentr", "position", "avg", "period", "active", "prefer",
         "special", "interval", "amount", "count", "rate", "ratio", "value",
-        "asset", "资金", "资产",
+        "asset", "date", "资金", "资产",
     ))
 
 
@@ -281,30 +292,54 @@ def _metric_label(key: str) -> str:
     return str(key)
 
 
+def _flatten_metrics(metrics: dict) -> dict:
+    """递归展平嵌套指标 dict，键保留路径（如 account.total_return_rate）。"""
+    out: dict = {}
+
+    def walk(node: dict, prefix: str) -> None:
+        for k, v in node.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                walk(v, key)
+            else:
+                out[key] = v
+
+    walk(metrics or {}, "")
+    return out
+
+
 def _metrics_summary(metrics: dict) -> list[tuple[str, str]]:
-    """按白名单提取指标摘要；命中敏感键直接跳过。"""
+    """按白名单提取指标摘要（支持嵌套 Schema）；命中敏感键直接跳过。"""
     if not metrics:
         return []
-    items = {str(k): v for k, v in metrics.items() if _metrics_allowed(str(k))}
-    if not items:
-        return []
-    ordered = []
-    used = set()
+    flat = _flatten_metrics(metrics)
+    allowed = {k: v for k, v in flat.items() if _metrics_allowed(k)}
+    ordered: list[tuple[str, str]] = []
+    used: set[str] = set()
     for canonical, label in _METRIC_LABELS:
-        for k in items:
-            if str(k).lower() == canonical and k not in used:
-                v = items[k]
-                if isinstance(v, (str, int, float, bool)):
-                    value = _fmt_pct(v) if any(p in (label or canonical) for p in _PCT_KEYS) else _fmt_num(v)
-                    ordered.append((label, value))
-                    used.add(k)
-                break
-    for k, v in items.items():  # 未命中的合法键按原样追加
-        if k in used or not isinstance(v, (str, int, float, bool)):
-            continue
-        label = _metric_label(k)
-        value = _fmt_pct(v) if any(p in k.lower() for p in _PCT_KEYS) else _fmt_num(v)
-        ordered.append((label, value))
+        for k, v in allowed.items():
+            seg = str(k).lower().rsplit(".", 1)[-1]
+            if seg != canonical or k in used:
+                continue
+            if isinstance(v, dict):
+                # style 等短值字典合并为 "a/b/c"；其余嵌套结构（已展平，理论不会出现）跳过
+                if "style" not in k.lower():
+                    continue
+                text = "/".join(
+                    str(x) for x in v.values() if isinstance(x, (str, int, float, bool))
+                )
+                if not text:
+                    continue
+                ordered.append((label, text))
+            elif isinstance(v, (str, int, float, bool)):
+                value = (
+                    _fmt_pct(v)
+                    if any(p in (label or canonical) for p in _PCT_KEYS)
+                    else _fmt_num(v)
+                )
+                ordered.append((label, value))
+            used.add(k)
+            break
     return ordered
 
 
@@ -577,12 +612,14 @@ _BEARISH_WORDS = ("减仓", "卖出", "看空", "清仓", "离场", "空仓", "�
 
 
 def _facts(metrics: dict) -> dict:
-    """从指标 dict 中模糊提取常用事实（键名不敏感）。"""
+    """从指标 dict 中模糊提取常用事实（支持嵌套 Schema，键名不敏感）。"""
+    flat = _flatten_metrics(metrics)
+
     def first(*keys):
         low_keys = [k.lower() for k in keys]
-        for raw_k, v in metrics.items():
-            k = str(raw_k).lower()
-            if any(lk == k or lk in k for lk in low_keys):
+        for raw_k, v in flat.items():
+            seg = str(raw_k).lower().rsplit(".", 1)[-1]
+            if any(lk == seg or lk in seg for lk in low_keys):
                 return v
         return None
     return {
@@ -593,8 +630,8 @@ def _facts(metrics: dict) -> dict:
         "holding": first("avg_holding_days", "avg_holding", "平均持仓周期", "平均持有天数"),
         "double": first("double_count", "翻倍次数"),
         "halved": first("halved_count", "腰斩次数"),
-        "count": first("total_trade_count", "总笔数", "交易笔数"),
-        "stocks": first("trade_stock_count", "交易股票数"),
+        "count": first("total_trade_count", "total_count", "总笔数", "交易笔数"),
+        "stocks": first("trade_stock_count", "distinct_stock_count", "交易股票数"),
         "style": first("style", "风格初判"),
     }
 

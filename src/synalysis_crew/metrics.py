@@ -20,8 +20,10 @@
 
     {
       "meta": {is_partial, start_date, end_date, calendar_days, active_trading_days, generated_at},
-      "account": {initial_balance, ending_balance, net_transfer_in, total_return_rate,
-                  annualized_return_rate, realized_pnl, total_cost, total_cost_ratio,
+      "account": {initial_balance, ending_balance, net_transfer_in,
+                  gross_deposit, gross_withdraw, opening_asset_value,
+                  total_return_rate, total_return_rate_net, annualized_return_rate,
+                  realized_pnl, total_cost, total_cost_ratio,
                   holding_market_value, holding_cost_value, unrealized_pnl,
                   market_value_source, valuation_date},
       "trading": {total_amount, total_count, buy_count, buy_amount, sell_count, sell_amount,
@@ -37,6 +39,12 @@
 
 说明：
 - 收益率/胜率/集中度等比率以小数存储（如 0.1234 = 12.34%）；最大回撤为正值（相对峰值跌幅）；
+- ``total_return_rate`` 主口径 = 期初资产基准：
+  基准 = 期初资金 + 期初持仓变现估值（≈ unmatched_sell_amount）；
+  收益率 = (期末资产 − 基准 − 净转入) / 基准；出金经净转入体现，不会把出金误当亏损。
+- 完整历史（期初资产 = 0）时退化为「累计入金基准」：
+  收益率 = (期末资产 − 累计入金) / 累计入金（用户视角：总共投入多少、现在剩多少）。
+- ``total_return_rate_net`` 为辅口径（纯现金期初基准，忽略期初持仓，仅供对照）。
 - 金额四舍五入到 2 位、比率到 4 位；非有限数输出 None，保证严格 JSON 序列化；
 - 无配对持仓的卖出（期初持仓）记入 ``unmatched_sell_amount``，不计入已实现盈亏与胜率。
 """
@@ -494,7 +502,11 @@ def _empty_result() -> MetricsResult:
                 "initial_balance": 0.0,
                 "ending_balance": 0.0,
                 "net_transfer_in": 0.0,
+                "gross_deposit": 0.0,
+                "gross_withdraw": 0.0,
+                "opening_asset_value": 0.0,
                 "total_return_rate": None,
+                "total_return_rate_net": None,
                 "annualized_return_rate": None,
                 "realized_pnl": 0.0,
                 "total_cost": 0.0,
@@ -603,6 +615,8 @@ def compute_metrics(
         )
     }
     net_transfer = 0.0
+    gross_deposit = 0.0
+    gross_withdraw = 0.0
     total_cost = 0.0
     balances: List[float] = []
     prev_balance = initial_balance
@@ -688,6 +702,10 @@ def compute_metrics(
         op = rec.op
         if op in (OP_TRANSFER_IN, OP_TRANSFER_OUT):
             net_transfer += cash_delta
+            if cash_delta > 0:
+                gross_deposit += cash_delta
+            else:
+                gross_withdraw += -cash_delta
         elif op in (OP_REVERSE_REPO, OP_DIVIDEND, OP_INTEREST, OP_IPO, OP_OTHER):
             sp = special[op]
             sp["count"] += 1
@@ -849,19 +867,31 @@ def compute_metrics(
                 halved_count += 1
 
     # ---- 收益率（H1 区间口径） ----
+    # 主口径：期初资产基准（期初资金 + 期初持仓变现估值）；期初资产为 0（完整历史）
+    # 时退化为累计入金基准。辅口径：纯现金期初基准（忽略期初持仓）。
     end_assets = ending_balance + holding_market_value
+    opening_position_value = unmatched_sell_amount  # 期初持仓变现估值（卖出未配对部分）
+    opening_asset_value = initial_balance + opening_position_value
+    total_return_rate = None
+    total_return_rate_net = None
+    if opening_asset_value > _EPS:
+        total_return_rate = (
+            end_assets - opening_asset_value - net_transfer
+        ) / opening_asset_value
+    elif gross_deposit > _EPS:
+        total_return_rate = (end_assets - gross_deposit) / gross_deposit
     if abs(initial_balance) > _EPS:
-        total_return_rate = (end_assets - initial_balance - net_transfer) / initial_balance
+        total_return_rate_net = (
+            end_assets - initial_balance - net_transfer
+        ) / initial_balance
     elif net_transfer > _EPS:
-        total_return_rate = (end_assets - net_transfer) / net_transfer
-    else:
-        total_return_rate = None
+        total_return_rate_net = (end_assets - net_transfer) / net_transfer
 
     span_days = (end_date - start_date).days
     annualized_return_rate = None
     if (
         total_return_rate is not None
-        and total_return_rate > -1.0
+        and total_return_rate > -0.5
         and span_days > 0
     ):
         annualized_return_rate = (1.0 + total_return_rate) ** (365.0 / span_days) - 1.0
@@ -1011,8 +1041,14 @@ def compute_metrics(
                 "initial_balance": _round2(initial_balance),
                 "ending_balance": _round2(ending_balance),
                 "net_transfer_in": _round2(net_transfer),
+                "gross_deposit": _round2(gross_deposit),
+                "gross_withdraw": _round2(gross_withdraw),
+                "opening_asset_value": _round2(opening_asset_value),
                 "total_return_rate": _round4(total_return_rate)
                 if total_return_rate is not None
+                else None,
+                "total_return_rate_net": _round4(total_return_rate_net)
+                if total_return_rate_net is not None
                 else None,
                 "annualized_return_rate": _round4(annualized_return_rate)
                 if annualized_return_rate is not None

@@ -24,7 +24,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-ACCENT = "#E8791F"
+ACCENT = "#10A37F"
 POS_COLOR = "#E5484D"  # A股习惯：红涨
 NEG_COLOR = "#30A46C"  # 绿跌
 TEXT_MAIN = "#23262C"
@@ -138,9 +138,9 @@ button[kind="primary"], [data-testid="stBaseButton-primary"] {
   padding: 3px 12px;
   margin: 3px 6px 3px 0;
   border-radius: 999px;
-  background: rgba(232, 121, 31, .10);
-  border: 1px solid rgba(232, 121, 31, .35);
-  color: #B45309;
+  background: rgba(16, 163, 127, .10);
+  border: 1px solid rgba(16, 163, 127, .35);
+  color: #0E7C60;
   font-size: .82rem;
   font-weight: 600;
 }
@@ -170,7 +170,7 @@ button[kind="primary"], [data-testid="stBaseButton-primary"] {
 .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .brand-icon {
   width: 30px; height: 30px; border-radius: 9px; flex: none;
-  background: linear-gradient(135deg, #F4A261, #E8791F);
+  background: linear-gradient(135deg, #34C27E, #10A37F);
   display: flex; align-items: center; justify-content: center;
   color: #FFFFFF; font-weight: 800; font-size: 1rem;
 }
@@ -484,6 +484,9 @@ def mock_metrics() -> dict:
         "initial_capital": round(initial, 2),
         "final_capital": round(final_cash, 2),
         "net_transfer_in": 0.0,
+        "gross_deposit": 0.0,
+        "gross_withdraw": 0.0,
+        "opening_asset_value": round(initial, 2),
         "total_return_pct": round(total_return_pct, 2),
         "annual_return_pct": round(annual_pct, 2),
         "realized_pnl": realized,
@@ -972,7 +975,9 @@ def render_account_overview(metrics: dict) -> None:
     )
     cards = [
         {"label": "总收益率", "value": _pct_text(acct.get("total_return_pct")),
-         "sub": acct.get("label") or ("区间收益" if is_partial else "总收益"),
+         "sub": (acct.get("label") or ("区间收益" if is_partial else "总收益"))
+                + " · "
+                + ("期初资产基准" if _num(acct.get("opening_asset_value")) > 0 else "累计入金基准"),
          "color": _sign_color(acct.get("total_return_pct"))},
         {"label": "年化收益率", "value": _pct_text(acct.get("annual_return_pct")),
          "sub": f"{int(acct.get('period_days') or 0)} 天折算",
@@ -1000,6 +1005,15 @@ def render_account_overview(metrics: dict) -> None:
         {"label": "平均持仓周期", "value": f"{_dec(trd.get('avg_holding_days'), 1)} 天"},
     ]
     _kpi_grid(cards2)
+    cards3 = [
+        {"label": "累计入金", "value": _fmt_money(acct.get("gross_deposit")),
+         "sub": "银行转证券合计"},
+        {"label": "累计出金", "value": _fmt_money(acct.get("gross_withdraw")),
+         "sub": "证券转银行合计"},
+        {"label": "净转入", "value": _fmt_money(acct.get("net_transfer_in")),
+         "sub": "入金 − 出金", "color": _sign_color(acct.get("net_transfer_in"))},
+    ]
+    _kpi_grid(cards3)
     st.subheader("累计收益曲线")
     fig = _equity_figure(metrics)
     if fig:
@@ -1347,6 +1361,9 @@ def _normalize_metrics(metrics: dict) -> dict:
         "initial_capital": acct.get("initial_balance"),
         "final_capital": acct.get("ending_balance"),
         "net_transfer_in": acct.get("net_transfer_in"),
+        "gross_deposit": acct.get("gross_deposit"),
+        "gross_withdraw": acct.get("gross_withdraw"),
+        "opening_asset_value": acct.get("opening_asset_value"),
         "total_return_pct": _num(acct.get("total_return_rate")),
         "annual_return_pct": _num(acct.get("annualized_return_rate")),
         "realized_pnl": acct.get("realized_pnl"),

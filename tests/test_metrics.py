@@ -318,8 +318,11 @@ def test_mid_history_with_initial_cash_is_partial():
     assert m["meta"]["is_partial"] is True
     assert m["account"]["initial_balance"] == pytest.approx(6010.0, abs=0.01)
     assert m["account"]["net_transfer_in"] == pytest.approx(20000.0, abs=0.01)
+    assert m["account"]["gross_deposit"] == pytest.approx(20000.0, abs=0.01)
+    assert m["account"]["gross_withdraw"] == pytest.approx(0.0, abs=0.01)
+    assert m["account"]["opening_asset_value"] == pytest.approx(6010.0, abs=0.01)
     assert m["account"]["ending_balance"] == pytest.approx(26495.0, abs=0.01)
-    # 总收益率 = (26495 - 6010 - 20000) / 6010 = 485 / 6010
+    # 总收益率（期初资产基准，无期初持仓）= (26495 - 6010 - 20000) / 6010 = 485 / 6010
     assert m["account"]["total_return_rate"] == pytest.approx(485 / 6010, abs=1e-4)
     assert m["account"]["realized_pnl"] == pytest.approx(485.0, abs=0.01)
     assert m["pnl"]["win_rate"] == pytest.approx(1.0, abs=1e-4)
@@ -340,8 +343,11 @@ def test_mid_history_with_opening_position_is_partial():
     assert m["pnl"]["realized_pnl"] == pytest.approx(200.0, abs=0.01)
     assert m["pnl"]["win_count"] == 1  # 只有配对的卖出计入胜率
     assert m["pnl"]["win_rate"] == pytest.approx(1.0, abs=1e-4)
-    # 期初资金为 0 且无净转入，无法计算收益率 -> None
-    assert m["account"]["total_return_rate"] is None
+    # 期初资产基准（含期初持仓变现估值 4000）：(4200 - 4000) / 4000 = 5%
+    assert m["account"]["opening_asset_value"] == pytest.approx(4000.0, abs=0.01)
+    assert m["account"]["total_return_rate"] == pytest.approx(0.05, abs=1e-4)
+    # 纯现金期初基准（期初资金 0 且无净转入）无法计算 -> None
+    assert m["account"]["total_return_rate_net"] is None
 
 
 def test_sell_exceeding_position_marks_partial():
