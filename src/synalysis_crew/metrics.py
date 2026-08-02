@@ -1,19 +1,39 @@
-"""指标计算引擎（Issue #2）。
+"""指标计算引擎 v2（docs/requirements-v2.md 1.1–1.6，唯一契约）。
 
 输入：``list[TradeRecord]``（跨模块契约见 docs/requirements.md 第 4 章，鸭子类型，
 不依赖 parser 具体实现；``op_type`` 支持 parser.OpType 枚举或中英文文本）。
 输出：``MetricsResult``（固定 JSON Schema，全英文 snake_case，可直接 json.dumps）。
 
-字段口径（与需求 2.3 对齐）：
+v2 口径（与 requirements-v2.md 对齐）：
 - ``amount``：按 parser 落地契约为「成交金额」（恒正）；本模块以「资金余额差额」
   （交易后资金余额 - 上一笔资金余额）作为现金流的权威信号，``amount`` 仅在余额缺失时兜底，
   因此买入费用入成本、卖出费用扣净额、净转入等口径自动成立；
 - 费用口径：``fee`` 含「手续费+其他杂费」，``transfer_fee`` 含「过户费+清算费(B股)」，
   总交易成本 = fee + stamp_tax + commission + transfer_fee（佣金与手续费取 max 防重复）；
-- FIFO 配对：同股票先进先出，买入费用入成本、卖出费用扣净额；已实现盈亏按卖出配对笔数统计；
-- 翻倍/腰斩：按个股完整持仓周期（首次买入→清仓）收益率 >= +100% / <= -50%；
-  期末仍持仓的周期按「成本 vs 最新价」估算（akshare 拉最新价，失败/未安装时按成本兜底，
-  并标记 ``market_value_source="cost"``，akshare 调用带超时控制）；
+- 完整交易（trades，1.1）：个股首次买入 → 清仓闭环（FIFO 配对，多笔买入/卖出合并为一个
+  闭环）；每闭环输出 code/name/buy_qty（实际买入数量）/buy_amount（含买入费用成本）/
+  sell_qty（配对卖出数量）/sell_amount（卖出净额扣费用）/pnl（周期盈亏）/
+  holding_days（首买日→清仓日，含首尾）/start_date/end_date/status="closed"；
+  分红/红股/利息/逆回购/指定交易/银行转账一律不进 trades（红股仅摊薄持仓成本与数量，
+  用于 FIFO 配对与闭环判定，不计入买入数量与买入成本）；期初持仓卖出（无法配对）不进
+  trades，单列 ``unmatched_sell_amount``；
+- 胜率/盈亏比/平均持仓周期/持仓周期分布（1.2）：均按**完整交易**统计（未清仓不计）；
+- 收益率（1.0 v2.1 TWR）：按交易日逐日模拟账户——现金 = 资金余额（权威，缺失时按
+  操作类型估计增量续链）；持仓数量按 BUY/SELL/红股增减；估值价 = 该股最近成交价
+  （交割单内最后已知价，BUY/SELL 更新，红股不更新）；期初持仓（未配对卖出部分）按
+  其变现价值以「合成持仓」计入期初资产（价值 1:1 跟踪，卖出时同步扣减，避免期初
+  持仓卖出被误算成收益）。每日 r_d = (当日末资产 − 当日净出入金 − 前一日末资产) /
+  前一日末资产（前一日末资产 ≤ 0 的日跳过）；出入金只影响分子扣除；分红/利息/
+  逆回购到期利息计为盈亏（不扣出入金）；逆回购本金以「应收款」1:1 跟踪
+  （价值中性，仅费用/利息计为盈亏，1 日回购影响本就极小，R-007 等多日回购
+  也不会扭曲日收益率）。累计 R = Π(1 + r_d) − 1，``total_return_rate`` 主口径 = 最终 R；
+  return_curve = 每月末累计 R [{month, date, return_rate}]（无记录月份沿用上一值），
+  equity_curve 保留原始净值供调试；**最大回撤/翻倍/腰斩基于逐日 (1 + R) 序列**；
+- 账户级翻倍/腰斩（1.4 v2.1）：翻倍 = 累计 R 达到 +100% 的独立事件（R 从 < 100%
+  升到 ≥ 100% 计 1 次，禁止「从运行低点翻倍」口径——接近归零的账户会产生假阳性）；
+  腰斩 = v ≤ 0.5·v_peak 的独立事件（创新高后重新计数）；
+- M6：首行「证券转银行」按其出金额计入现金流转（net_transfer/gross_withdraw/
+  月转账），期初资金 = 余额 + 出金额；
 - 区间口径：期初资金 != 0 或期初有持仓（文件内先卖后买）时 ``is_partial=True``。
 
 固定 JSON Schema：::
@@ -31,7 +51,7 @@
                   avg_trade_amount, capital_turnover_rate, avg_holding_period_days},
       "pnl": {realized_pnl, win_count, loss_count, win_rate, total_profit, total_loss,
               profit_loss_ratio, max_single_profit, max_single_loss, double_count, halved_count,
-              unmatched_sell_amount, monthly_pnl[], equity_curve[], max_drawdown,
+              unmatched_sell_amount, monthly_pnl[], equity_curve[], return_curve[], max_drawdown,
               stock_leaderboard{top_profit[], top_loss[]}},
       "trades": [完整交易：买入→清仓闭环，{code, name, buy_qty, buy_amount, sell_qty,
                 sell_amount, pnl, holding_days, start_date, end_date, status}],
@@ -41,16 +61,16 @@
 
 说明：
 - 收益率/胜率/集中度等比率以小数存储（如 0.1234 = 12.34%）；最大回撤为正值（相对峰值跌幅）；
-- ``total_return_rate`` 主口径 = 期初资产基准：
-  基准 = 期初资金 + 期初持仓变现估值（≈ unmatched_sell_amount）；
-  收益率 = (期末资产 − 基准 − 净转入) / 基准；出金经净转入体现，不会把出金误当亏损。
-- 完整历史（期初资产 = 0）时退化为「累计入金基准」：
-  收益率 = (期末资产 − 累计入金) / 累计入金（用户视角：总共投入多少、现在剩多少）。
-- ``total_return_rate_net`` 为辅口径（纯现金期初基准，忽略期初持仓，仅供对照）。
-- ``win_rate/盈亏比/持仓周期`` 均按**完整交易**（个股首次买入→清仓闭环）统计，
-  每闭环计一笔：周期盈亏 = 卖出净额 − 买入成本（含费用）；
-- ``double_count/halved_count`` 为**账户级**：按月末近似净值曲线统计
-  「从低点翻倍」与「从高点腰斩（回撤≥50%）」的独立事件次数；
+- ``total_return_rate`` 主口径 = 逐日 TWR 最终累计收益率 R（1.0），出入金不影响
+  收益率本身；无任何有效日收益（如全部起始日资产 ≤ 0）时输出 None。
+- ``total_return_rate_net`` 为对照口径（期初资产基准简单收益率）：
+  (期末资产 − A0 − 净转入) / A0；A0 = 0（完整历史）时退化为
+  (期末资产 − 累计入金) / 累计入金。
+- ``win_rate/盈亏比/持仓周期`` 均按**完整交易**统计，每闭环计一笔：
+  周期盈亏 = 卖出净额 − 买入成本（含费用）；
+- ``double_count/halved_count`` 为**账户级**：按逐日 v = 1 + R 序列统计
+  「R 从 < 100% 升到 ≥ 100% 的翻倍」与「v ≤ 0.5·v_peak 的腰斩（创新高重置）」；
+- ``top_loss`` 按 total_pnl **升序**（亏损最多在前），``top_profit`` 降序；
 - 金额四舍五入到 2 位、比率到 4 位；非有限数输出 None，保证严格 JSON 序列化；
 - 无配对持仓的卖出（期初持仓）记入 ``unmatched_sell_amount``，不计入已实现盈亏与胜率。
 """
@@ -62,7 +82,7 @@ import queue
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -183,7 +203,9 @@ def _round2(value: float) -> Optional[float]:
 def _round4(value: float) -> Optional[float]:
     if value is None or not math.isfinite(value):
         return None
-    return round(value, 4)
+    result = round(value, 4)
+    # 归一化 -0.0 -> 0.0，保证 JSON 输出与前端展示一致
+    return 0.0 if result == 0 else result
 
 
 def _months_between(start: date, end: date) -> List[str]:
@@ -196,6 +218,13 @@ def _months_between(start: date, end: date) -> List[str]:
             year += 1
             month = 1
     return months
+
+
+def _month_end_date(year: int, month: int) -> date:
+    """某年某月的最后一天。"""
+    if month == 12:
+        return date(year, 12, 31)
+    return date(year, month + 1, 1) - timedelta(days=1)
 
 
 @dataclass
@@ -239,20 +268,22 @@ class _Lot:
 
 @dataclass
 class _Cycle:
-    """个股完整持仓周期（首次买入→清仓）。"""
+    """个股完整持仓周期（首次买入→清仓闭环）。
+
+    - ``bought_qty``：实际买入股数（红股不计入，trades 的 buy_qty 口径）；
+    - ``acquired_qty``：买入 + 红股入账的总数量（用于闭环判定，防止卖出含红股时
+      尚未清仓却提前闭环）；
+    - ``buy_cost``：实际买入成本（含买入费用），红股零成本摊薄；
+    - ``proceeds``：已配对卖出的净额（扣卖出费用）。
+    """
 
     bought_qty: float = 0.0
+    acquired_qty: float = 0.0
     sold_qty: float = 0.0
     buy_cost: float = 0.0
     proceeds: float = 0.0
-    remaining_cost: float = 0.0
     start_date: Optional[date] = None
     end_date: Optional[date] = None
-
-    def return_rate(self) -> Optional[float]:
-        if self.buy_cost <= _EPS:
-            return None
-        return (self.proceeds - self.buy_cost) / self.buy_cost
 
 
 @dataclass
@@ -310,6 +341,50 @@ def _estimate_cash_delta(rec: _Rec) -> float:
     if rec.op == OP_REVERSE_REPO:
         return -(rec.gross + rec.cost_fields)
     return rec.amount
+
+
+def _prescan_unmatched(
+    recs: Sequence[_Rec], initial_balance: float
+) -> Tuple[Dict[str, float], float]:
+    """v2.1 轻量 FIFO 预扫描：逐股计算「期初持仓未配对卖出额」（变现价值）。
+
+    与主循环 FIFO 语义一致（红股仅在有持仓时增加可用数量），结果用于：
+    - ``opening_asset_value`` 期初资产中的「合成持仓」（价值 1:1）；
+    - 逐日 TWR 模拟开始时计入期初资产，未配对卖出时同步扣减，
+      保证期初持仓卖出不产生虚假收益。
+
+    返回 (逐股未配对卖出额, 合计)。
+    """
+    avail: Dict[str, float] = defaultdict(float)
+    unmatched: Dict[str, float] = defaultdict(float)
+    prev_balance = initial_balance
+    for rec in recs:
+        if rec.balance is not None:
+            cash_delta = rec.balance - prev_balance
+            prev_balance = rec.balance
+        else:
+            cash_delta = _estimate_cash_delta(rec)
+        op = rec.op
+        if op == OP_BUY and rec.qty > _EPS:
+            avail[rec.code] += rec.qty
+        elif (
+            op == OP_BONUS_SHARE
+            and rec.qty > _EPS
+            and avail.get(rec.code, 0.0) > _EPS
+        ):
+            avail[rec.code] += rec.qty
+        elif op == OP_SELL and rec.qty > _EPS:
+            take = min(rec.qty, avail.get(rec.code, 0.0))
+            remaining = rec.qty - take
+            if remaining > _EPS:
+                proceeds = (
+                    cash_delta
+                    if cash_delta > _EPS
+                    else rec.gross - rec.cost_fields
+                )
+                unmatched[rec.code] += proceeds * remaining / rec.qty
+            avail[rec.code] = max(0.0, avail[rec.code] - take)
+    return dict(unmatched), sum(unmatched.values())
 
 
 def _parse_spot_frame(frame: Any) -> Optional[Dict[str, float]]:
@@ -553,6 +628,7 @@ def _empty_result() -> MetricsResult:
                 "unmatched_sell_amount": 0.0,
                 "monthly_pnl": [],
                 "equity_curve": [],
+                "return_curve": [],
                 "max_drawdown": 0.0,
                 "stock_leaderboard": {"top_profit": [], "top_loss": []},
             },
@@ -582,6 +658,8 @@ def _empty_result() -> MetricsResult:
                     "other": {"count": 0, "amount": 0.0},
                 },
             },
+            "stocks": [],
+            "trades": [],
         }
     )
 
@@ -598,14 +676,27 @@ def compute_metrics(
     first = recs[0]
     if first.balance is None:
         initial_balance = 0.0
-    elif first.op in (OP_TRANSFER_IN, OP_TRANSFER_OUT):
-        # 文件以转账开头：银行转证券视为从 0 开始（完整历史），证转银无法反推则按余额本身
-        initial_balance = 0.0 if first.op == OP_TRANSFER_IN else first.balance
+    elif first.op == OP_TRANSFER_IN:
+        # 首行银行转证券：完整历史，视为从 0 开始
+        initial_balance = 0.0
+    elif first.op == OP_TRANSFER_OUT:
+        # M6：首行证券转银行——该笔出金必须计入现金流转（net_transfer/
+        # gross_withdraw/月转账），期初资金 = 余额 + 出金额。出金额以记录
+        # 的成交金额字段为代理（parser 未暴露「发生金额」列；同花顺导出若
+        # 成交金额为空则无法从契约字段重建，保持按余额反推）。
+        out_amount = first.amount if first.amount > _EPS else 0.0
+        initial_balance = first.balance + out_amount
     else:
         initial_balance = first.balance - _estimate_cash_delta(first)
 
     start_date = recs[0].date
     end_date = recs[-1].date
+
+    # ---- v2.1 期初持仓预扫描：逐股未配对卖出额 = 期初持仓变现价值（合成持仓） ----
+    unmatched_by_stock, unmatched_sell_amount = _prescan_unmatched(
+        recs, initial_balance
+    )
+    opening_asset_value = initial_balance + unmatched_sell_amount
 
     stocks: Dict[str, _StockState] = {}
     code_name: Dict[str, str] = {}
@@ -623,6 +714,8 @@ def compute_metrics(
     net_transfer = 0.0
     gross_deposit = 0.0
     gross_withdraw = 0.0
+    month_transfer: Dict[str, float] = defaultdict(float)
+    month_deposit: Dict[str, float] = defaultdict(float)
     total_cost = 0.0
     balances: List[float] = []
     prev_balance = initial_balance
@@ -657,8 +750,6 @@ def compute_metrics(
     total_loss = 0.0
     max_profit: Optional[float] = None
     max_loss: Optional[float] = None
-    double_count = 0
-    halved_count = 0
     unmatched_sell_amount = 0.0
 
     dist = {"le_1d": 0, "2_5d": 0, "6_20d": 0, "gt_20d": 0}
@@ -679,6 +770,48 @@ def compute_metrics(
 
     def holding_cost_now() -> float:
         return sum(state.holding_cost() for state in stocks.values())
+
+    # ---- v2.1 逐日 TWR 模拟状态 ----
+    # 现金以资金余额为权威（缺失时按估计增量续链）；持仓估值价 = 最近成交价；
+    # 合成持仓（期初持仓变现价值）从模拟开始计入期初资产，未配对卖出时同步扣减。
+    synthetic_remaining: Dict[str, float] = dict(unmatched_by_stock)
+    last_price: Dict[str, float] = {}
+    repo_receivable = 0.0  # v2.1：逆回购本金按 1:1「应收款」跟踪（价值中性）
+    cash = initial_balance
+    current_day: Optional[date] = None
+    day_flow = 0.0
+    prev_day_end = opening_asset_value
+    cum_v = 1.0
+    daily_v: List[float] = []  # 每个有效交易日结算后的累计 (1 + R)
+    day_R: Dict[date, Optional[float]] = {}  # 每个记录日结算后的累计 R（跳过日为 None）
+
+    def finalize_twr_day() -> None:
+        """结算当前交易日的 r_d（v2.1 1.0）。
+
+        r_d = (当日末资产 − 当日净出入金 − 前一日末资产) / 前一日末资产；
+        前一日末资产 ≤ 0 的日跳过；出入金只影响分子扣除；分红/利息/逆回购到期
+        利息计为盈亏（不扣出入金）；逆回购本金以「应收款」1:1 跟踪（价值中性，
+        仅费用/利息计盈亏），1 日回购影响本就极小，R-007 等多日回购也不会扭曲
+        日收益率。
+        """
+        nonlocal cum_v, prev_day_end
+        assets_end = (
+            cash
+            + sum(
+                state.holding_qty() * last_price.get(code, 0.0)
+                for code, state in stocks.items()
+            )
+            + sum(synthetic_remaining.values())
+            + repo_receivable
+        )
+        r_d: Optional[float] = None
+        if prev_day_end > _EPS:
+            r_d = (assets_end - day_flow - prev_day_end) / prev_day_end
+            cum_v *= 1.0 + r_d
+        prev_day_end = assets_end
+        day_R[current_day] = None if r_d is None else cum_v - 1.0
+        if r_d is not None:
+            daily_v.append(cum_v)
 
     def update_max_pos(code: str, name: str, trade_date: date) -> None:
         nonlocal max_pos_ratio, max_pos_code, max_pos_name, max_pos_date
@@ -707,14 +840,26 @@ def compute_metrics(
             prev_month = month
         last_date = rec.date
 
+        # v2.1：交易日切换时先结算上一交易日的 r_d
+        if current_day is None:
+            current_day = rec.date
+        elif rec.date != current_day:
+            finalize_twr_day()
+            current_day = rec.date
+            day_flow = 0.0
+
         cash_delta = (
             rec.balance - prev_balance
             if rec.balance is not None
             else _estimate_cash_delta(rec)
         )
+        # 现金：资金余额为权威，缺失时按估计增量续链
         if rec.balance is not None:
+            cash = rec.balance
             last_balance = rec.balance
             balances.append(rec.balance)
+        else:
+            cash += _estimate_cash_delta(rec)
         total_cost += rec.cost_fields
 
         if rec.code:
@@ -723,14 +868,28 @@ def compute_metrics(
         op = rec.op
         if op in (OP_TRANSFER_IN, OP_TRANSFER_OUT):
             net_transfer += cash_delta
+            month_transfer[month] += cash_delta
+            day_flow += cash_delta  # v2.1：当日净出入金（只影响 r_d 分子）
             if cash_delta > 0:
                 gross_deposit += cash_delta
+                month_deposit[month] += cash_delta
             else:
                 gross_withdraw += -cash_delta
         elif op in (OP_REVERSE_REPO, OP_DIVIDEND, OP_INTEREST, OP_IPO, OP_OTHER):
             sp = special[op]
             sp["count"] += 1
             sp["amount"] += abs(cash_delta) if op == OP_REVERSE_REPO else cash_delta
+            if op == OP_REVERSE_REPO:
+                # v2.1：逆回购本金 1:1 应收款——融出腿记入、到期腿按成交金额回补扣减，
+                # 仅费用/利息计为当日盈亏。1 日回购影响本已极小；R-007 等多日回购
+                # 若按纯盈亏处理会使单日 r_d 击穿 -100%，(1+R) 失真（见 1.0 注释）。
+                if cash_delta < -_EPS:
+                    repo_receivable += (
+                        rec.amount if rec.amount > _EPS else -cash_delta
+                    )
+                elif cash_delta > _EPS:
+                    principal = rec.amount if rec.amount > _EPS else cash_delta
+                    repo_receivable = max(0.0, repo_receivable - principal)
         elif op == OP_BONUS_SHARE:
             sp = special[op]
             sp["count"] += 1
@@ -744,9 +903,11 @@ def compute_metrics(
                         lot.qty *= factor
                         lot.unit_cost /= factor  # 红股摊薄单位成本，成本基础总额不变
                     if state.cycle is not None:
-                        state.cycle.bought_qty += rec.qty
+                        state.cycle.acquired_qty += rec.qty
         elif op in (OP_BUY, OP_SELL) and rec.qty > _EPS:
             code = rec.code
+            if rec.price > _EPS:
+                last_price[code] = rec.price  # v2.1：估值价 = 最近成交价
             state = stocks.setdefault(code, _StockState())
             equity_dates.add(rec.date)
             counts["total"] += 1
@@ -771,8 +932,8 @@ def compute_metrics(
                 if state.cycle is None:
                     state.cycle = _Cycle(start_date=rec.date)
                 state.cycle.bought_qty += rec.qty
+                state.cycle.acquired_qty += rec.qty
                 state.cycle.buy_cost += cost
-                state.cycle.remaining_cost += cost
                 update_max_pos(code, rec.name, rec.date)
             else:
                 counts["sell"] += 1
@@ -797,26 +958,29 @@ def compute_metrics(
                     if state.cycle is not None:
                         state.cycle.sold_qty += take
                         state.cycle.proceeds += allocated
-                        state.cycle.remaining_cost = max(
-                            0.0, state.cycle.remaining_cost - cost_taken
-                        )
                     lot.qty -= take
                     if lot.qty <= _EPS:
                         state.lots.popleft()
                     remaining -= take
                 if remaining > _EPS:
                     state.pre_qty += remaining
-                    unmatched_sell_amount += proceeds * remaining / rec.qty
+                    unmatched_amount = proceeds * remaining / rec.qty
+                    unmatched_sell_amount += unmatched_amount
+                    # v2.1：未配对卖出同步扣减合成持仓（价值 1:1），
+                    # 期初持仓变现不产生虚假收益
+                    synthetic_remaining[code] = max(
+                        0.0, synthetic_remaining.get(code, 0.0) - unmatched_amount
+                    )
                 if matched_qty > _EPS:
                     realized_total += pnl
                     realized_by_month[month] += pnl
                     code_realized[code] += pnl
                 if (
                     state.cycle is not None
-                    and state.cycle.sold_qty >= state.cycle.bought_qty - _EPS
+                    and state.cycle.acquired_qty > _EPS
+                    and state.cycle.sold_qty >= state.cycle.acquired_qty - _EPS
                 ):
                     state.cycle.end_date = rec.date
-                    cycle_return = state.cycle.return_rate()
                     cycle_pnl = state.cycle.proceeds - state.cycle.buy_cost
                     hold_days = (rec.date - state.cycle.start_date).days + 1
                     completed_trades.append(
@@ -860,18 +1024,19 @@ def compute_metrics(
                             if cycle_max_loss is None
                             else min(cycle_max_loss, cycle_pnl)
                         )
-                    state.cycle.remaining_cost = 0.0
                     state.cycle = None
                 update_max_pos(code, rec.name, rec.date)
 
         if rec.balance is not None:
             prev_balance = rec.balance
 
+    if current_day is not None:
+        finalize_twr_day()  # 结算最后一个交易日
     ending_balance = last_balance
     if prev_month is not None:
         snapshots.append((prev_month, last_date, ending_balance, holding_cost_now()))
 
-    # ---- 期末持仓估值（H3：akshare 最新价，失败按成本兜底） ----
+    # ---- 期末持仓估值（akshare 最新价，失败按成本兜底） ----
     held_codes = sorted(
         code for code, state in stocks.items() if state.holding_qty() > _EPS
     )
@@ -898,26 +1063,127 @@ def compute_metrics(
         market_value = qty * price
         holding_market_value += market_value
         code_unrealized[code] = market_value - cost
-    # ---- 收益率（H1 区间口径） ----
-    # 主口径：期初资产基准（期初资金 + 期初持仓变现估值）；期初资产为 0（完整历史）
-    # 时退化为累计入金基准。辅口径：纯现金期初基准（忽略期初持仓）。
+
+    # 期初资产 A0 = 期初资金 + 期初持仓变现估值（已在预扫描后确定，
+    # 供 v2.1 逐日模拟与对照口径共用）
+
+    # ---- 月末资产近似净值（equity_curve 保留原始净值供调试） ----
+    # 月度近似资产 equity_m = 月末资金余额 + 月末持仓成本；
+    # 无记录月份沿用上一月末余额/持仓成本（月末最后一天为快照日）。
+    months = _months_between(start_date, end_date)
+    snap_by_month = {month: (d, bal, cost) for month, d, bal, cost in snapshots}
+    expanded: List[Tuple[str, date, float, float]] = []
+    carried: Optional[Tuple[float, float]] = None
+    for month in months:
+        if month in snap_by_month:
+            snapshot_date, balance, holding_cost = snap_by_month[month]
+            carried = (balance, holding_cost)
+        else:
+            snapshot_date = _month_end_date(
+                int(month[:4]), int(month[5:7])
+            )
+            balance, holding_cost = carried if carried is not None else (0.0, 0.0)
+        expanded.append((month, snapshot_date, balance, holding_cost))
+
+    equity_curve: List[Dict[str, Any]] = []
+    base_equity: Optional[float] = None
+    peak_equity: Optional[float] = None
+    for month, snapshot_date, balance, holding_cost in expanded:
+        equity = balance + holding_cost
+        if base_equity is None:
+            base_equity = equity
+        peak_equity = equity if peak_equity is None else max(peak_equity, equity)
+        drawdown = (peak_equity - equity) / peak_equity if peak_equity > _EPS else 0.0
+        equity_curve.append(
+            {
+                "month": month,
+                "date": snapshot_date.isoformat(),
+                "balance": _round2(balance),
+                "holding_cost": _round2(holding_cost),
+                "equity": _round2(equity),
+                "net_value": _round4(equity / base_equity)
+                if base_equity and base_equity > _EPS
+                else 0.0,
+                "drawdown": _round4(drawdown),
+            }
+        )
+
+    # ---- v2.1 收益率曲线：每月末累计 R（无记录月份沿用上一值补齐） ----
+    last_record_day: Dict[str, date] = {}
+    for rec in recs:
+        last_record_day[f"{rec.date.year:04d}-{rec.date.month:02d}"] = rec.date
+    return_curve: List[Dict[str, Any]] = []
+    carried_r: Optional[float] = None
+    for month in months:
+        record_day = last_record_day.get(month)
+        if record_day is None:
+            r_val = carried_r
+            snapshot_date = _month_end_date(int(month[:4]), int(month[5:7]))
+        else:
+            r_val = day_R.get(record_day)
+            if r_val is None:
+                r_val = carried_r
+            snapshot_date = record_day
+        if r_val is not None:
+            carried_r = r_val
+        return_curve.append(
+            {
+                "month": month,
+                "date": snapshot_date.isoformat(),
+                "return_rate": _round4(r_val) if r_val is not None else None,
+            }
+        )
+
+    # ---- v2.1 最大回撤：基于逐日 (1 + R) 序列（正值，相对峰值跌幅） ----
+    # 峰值起点为 v0 = 1 + R0 = 1.0（首日即下跌也按起点计回撤）。
+    max_drawdown = 0.0
+    peak_v = 1.0
+    for v in daily_v:
+        if v > peak_v:
+            peak_v = v
+        max_drawdown = max(max_drawdown, (peak_v - v) / peak_v)
+
+    # ---- 账户级翻倍 / 腰斩（1.4 v2.1）：逐日 v = 1 + R 序列 ----
+    # 翻倍：累计 R 从 < 100% 升到 ≥ 100% 计 1 次独立事件
+    #（禁止「从运行低点翻倍」——接近归零的账户会产生假阳性）。
+    double_count = 0
+    above_double = False
+    for v in daily_v:
+        if v >= 2.0:
+            if not above_double:
+                double_count += 1
+                above_double = True
+        else:
+            above_double = False
+
+    # 腰斩：v ≤ 0.5 × v_peak 的独立事件；创新高重置，回升过半腰线后重新计数。
+    # 运行峰值起点同样为 v0 = 1.0。
+    halved_count = 0
+    run_peak = 1.0
+    below_half = False
+    for v in daily_v:
+        if v > run_peak:
+            run_peak = v
+            below_half = False
+        if v <= run_peak * 0.5:
+            if not below_half:
+                halved_count += 1
+                below_half = True
+        else:
+            below_half = False
+
+    # ---- v2.1 收益率：主口径 = 逐日 TWR 最终 R ----
+    total_return_rate = None if not daily_v else cum_v - 1.0
+
+    # ---- 辅口径（对照）：期初资产基准简单收益率；A0=0 退化累计入金基准 ----
     end_assets = ending_balance + holding_market_value
-    opening_position_value = unmatched_sell_amount  # 期初持仓变现估值（卖出未配对部分）
-    opening_asset_value = initial_balance + opening_position_value
-    total_return_rate = None
     total_return_rate_net = None
     if opening_asset_value > _EPS:
-        total_return_rate = (
+        total_return_rate_net = (
             end_assets - opening_asset_value - net_transfer
         ) / opening_asset_value
     elif gross_deposit > _EPS:
-        total_return_rate = (end_assets - gross_deposit) / gross_deposit
-    if abs(initial_balance) > _EPS:
-        total_return_rate_net = (
-            end_assets - initial_balance - net_transfer
-        ) / initial_balance
-    elif net_transfer > _EPS:
-        total_return_rate_net = (end_assets - net_transfer) / net_transfer
+        total_return_rate_net = (end_assets - gross_deposit) / gross_deposit
 
     span_days = (end_date - start_date).days
     annualized_return_rate = None
@@ -957,57 +1223,6 @@ def compute_metrics(
         total_cost / turnover["total"] if turnover["total"] > _EPS else 0.0
     )
 
-    # ---- 月末资产近似净值 + 最大回撤 ----
-    equity_curve: List[Dict[str, Any]] = []
-    base_equity: Optional[float] = None
-    peak_equity: Optional[float] = None
-    max_drawdown = 0.0
-    for month, snapshot_date, balance, holding_cost in snapshots:
-        equity = balance + holding_cost
-        if base_equity is None:
-            base_equity = equity
-        peak_equity = equity if peak_equity is None else max(peak_equity, equity)
-        drawdown = (peak_equity - equity) / peak_equity if peak_equity > _EPS else 0.0
-        max_drawdown = max(max_drawdown, drawdown)
-        equity_curve.append(
-            {
-                "month": month,
-                "date": snapshot_date.isoformat(),
-                "balance": _round2(balance),
-                "holding_cost": _round2(holding_cost),
-                "equity": _round2(equity),
-                "net_value": _round4(equity / base_equity)
-                if base_equity and base_equity > _EPS
-                else 0.0,
-                "drawdown": _round4(drawdown),
-            }
-        )
-
-    # ---- 账户级翻倍 / 腰斩（按月末近似净值曲线的独立事件计数） ----
-    double_count = 0
-    halved_count = 0
-    run_min: Optional[float] = None
-    run_peak: Optional[float] = None
-    doubled_episode = False
-    halved_episode = False
-    for point in equity_curve:
-        eq = point["equity"] or 0.0
-        if eq <= _EPS:
-            continue
-        if run_min is None or eq < run_min:
-            run_min = eq
-            doubled_episode = False
-        if run_peak is None or eq > run_peak:
-            run_peak = eq
-            halved_episode = False
-        if run_min > _EPS and eq >= run_min * 2.0 and not doubled_episode:
-            double_count += 1
-            doubled_episode = True
-        if run_peak > _EPS and eq <= run_peak * 0.5 and not halved_episode:
-            halved_count += 1
-            halved_episode = True
-
-    months = _months_between(start_date, end_date)
     monthly_pnl = [
         {"month": month, "pnl": _round2(realized_by_month.get(month, 0.0))}
         for month in months
@@ -1188,6 +1403,7 @@ def compute_metrics(
                 "unmatched_sell_amount": _round2(unmatched_sell_amount),
                 "monthly_pnl": monthly_pnl,
                 "equity_curve": equity_curve,
+                "return_curve": return_curve,
                 "max_drawdown": _round4(max_drawdown),
                 "stock_leaderboard": {
                     "top_profit": top_profit,

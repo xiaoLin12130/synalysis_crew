@@ -1,15 +1,20 @@
-"""指标计算引擎测试（Issue #2，Agent A2）。
+"""指标计算引擎 v2.1 测试（docs/requirements-v2.md 1.0–1.6 + 数据字典）。
 
 覆盖：
 - 完整历史 / 中途开始（is_partial）两种场景；
-- 胜率、盈亏比、最大回撤、翻倍/腰斩次数的手算抽查；
-- FIFO 配对（含费用入成本/扣净额、拆分红股按比例摊薄成本）；
+- 完整交易 trades：闭环字段齐备、FIFO 配对（费用入成本/扣净额）、红股只摊薄不记入
+  买入数量、分红/利息/逆回购/指定交易/转账一律不进 trades、期初持仓卖出只记
+  unmatched_sell_amount；
+- 胜率/盈亏比/平均持仓周期/持仓周期分布按完整交易统计（未清仓不计）；
+- 收益率（1.0 v2.1 TWR）：逐日模拟、现金以余额为权威、持仓按最近成交价估值、
+  期初持仓合成 1:1 跟踪（卖出不产生虚假收益）、出入金不影响收益率本身、
+  return_curve 每月末累计 R（无记录月份沿用上一值补齐）；
+- 最大回撤基于逐日 (1+R) 序列；账户级翻倍（R ≥ +100% 独立事件）/腰斩
+  （v ≤ 0.5·v_peak 独立事件，创新高重置）；
+- 亏损榜 top_loss 升序（亏损最多在前）、top_profit 降序；
 - akshare 最新价成功 / 失败按成本兜底（monkeypatch，不发网络请求）；
-- 特殊操作（逆回购/分红/利息/指定交易）不混入股票交易统计；
-- 固定 JSON Schema（全英文 snake_case、可严格 JSON 序列化）。
-
-TradeRecord 优先使用 parser 已落地的契约定义（try/except），失败则回退到
-测试文件内部的最小 stub dataclass（字段与 docs/requirements.md 第 4 章一致）。
+- 固定 JSON Schema（全英文 snake_case、可严格 JSON 序列化），_empty_result 含
+  trades/return_curve/stocks 等新字段。
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from types import SimpleNamespace
 
@@ -98,6 +103,17 @@ def T(
     )
 
 
+@pytest.fixture()
+def no_price_fetch(monkeypatch):
+    """封死行情拉取：任何指标计算都按成本兜底，保证确定性与离线。"""
+    monkeypatch.setattr(
+        metrics_module,
+        "_fetch_latest_prices",
+        lambda codes, timeout=15.0: None,
+    )
+    return None
+
+
 def _full_history_trades() -> list[TradeRecord]:
     """完整历史手算场景（费用为 0，数字均为精确值）。"""
     return [
@@ -117,22 +133,53 @@ def _full_history_trades() -> list[TradeRecord]:
     ]
 
 
+def _deposit_basis_double_halved_trades() -> list[TradeRecord]:
+    """A0=0（累计入金基准）场景：v 序列 [1.5, 0.7333, 1.7333, 1.3333]。
+
+    手算：入金 10000（1 月）+ 5000（2 月），累计入金 15000；
+    A +5000 / B -9000 / C +15000 / D -6000，期末资产 20000。
+    """
+    return [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
+        T("A", "A股", "BUY", 100, 50, 5000, 5000, date(2024, 1, 3)),
+        T("A", "A股", "SELL", 100, 100, 10000, 15000, date(2024, 1, 5)),
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 20000, date(2024, 2, 1)),
+        T("B", "B股", "BUY", 100, 100, 10000, 10000, date(2024, 2, 5)),
+        T("B", "B股", "SELL", 100, 10, 1000, 11000, date(2024, 2, 10)),
+        T("C", "C股", "BUY", 100, 50, 5000, 6000, date(2024, 3, 2)),
+        T("C", "C股", "SELL", 100, 200, 20000, 26000, date(2024, 3, 10)),
+        T("D", "D股", "BUY", 100, 100, 10000, 16000, date(2024, 4, 2)),
+        T("D", "D股", "SELL", 100, 40, 4000, 20000, date(2024, 4, 10)),
+    ]
+
+
+def _opening_asset_basis_trades() -> list[TradeRecord]:
+    """A0>0（期初资产基准）场景：期初持仓变现 4000，2 月入金 10000，3 月盈利 5000。
+
+    v 序列 [1.0, 1.0, 2.25]：3 月 v >= 2*v_min=2.0 → 翻倍 1 次。
+    """
+    return [
+        T("OLD", "老股", "SELL", 200, 20, 4000, 4000, date(2025, 1, 5)),
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 14000, date(2025, 2, 3)),
+        T("N", "N股", "BUY", 100, 50, 5000, 9000, date(2025, 3, 2)),
+        T("N", "N股", "SELL", 100, 100, 10000, 19000, date(2025, 3, 5)),
+    ]
+
+
 # ---------------------------------------------------------------------------
-# A/B/C/D 全指标手算抽查（完整历史）
+# 完整历史手算抽查（账户 / 交易统计）
 # ---------------------------------------------------------------------------
 
 
-def test_full_history_hand_check_account_and_trading():
+def test_full_history_hand_check_account_and_trading(no_price_fetch):
     m = compute_metrics(_full_history_trades())
 
-    # meta / 区间口径
     assert m["meta"]["is_partial"] is False
     assert m["meta"]["start_date"] == "2024-01-01"
     assert m["meta"]["end_date"] == "2024-04-25"
     assert m["meta"]["calendar_days"] == 116
     assert m["meta"]["active_trading_days"] == 12
 
-    # A 账户总览
     a = m["account"]
     assert a["initial_balance"] == 0.0
     assert a["ending_balance"] == pytest.approx(100600.0, abs=0.01)
@@ -146,7 +193,6 @@ def test_full_history_hand_check_account_and_trading():
     assert a["holding_market_value"] == 0.0
     assert a["market_value_source"] == "cost"
 
-    # B 交易统计
     t = m["trading"]
     assert t["total_amount"] == pytest.approx(13600.0, abs=0.01)
     assert t["total_count"] == 12
@@ -166,13 +212,14 @@ def test_full_history_hand_check_account_and_trading():
         ]
     ) / 13
     assert t["capital_turnover_rate"] == pytest.approx(13600 / avg_balance, abs=0.01)
-    assert t["avg_holding_period_days"] == pytest.approx(13.0, abs=0.01)
+    # 平均持仓周期按完整交易：A 2 / B 3 / C 8 / D 15 / E 20 / F 36 天 → 14 天
+    assert t["avg_holding_period_days"] == pytest.approx(14.0, abs=0.01)
 
 
-def test_full_history_hand_check_pnl_and_behavior():
+def test_full_history_hand_check_pnl_behavior_and_trades(no_price_fetch):
     m = compute_metrics(_full_history_trades())
 
-    # C 盈亏分析（手算：A +1500，B -600，C +400，D +200，E -1000，F +100）
+    # C 盈亏分析（按完整交易：A +1500，B -600，C +400，D +200，E -1000，F +100）
     p = m["pnl"]
     assert p["realized_pnl"] == pytest.approx(600.0, abs=0.01)
     assert p["win_count"] == 4
@@ -183,42 +230,72 @@ def test_full_history_hand_check_pnl_and_behavior():
     assert p["profit_loss_ratio"] == pytest.approx(2200 / 1600, abs=1e-4)
     assert p["max_single_profit"] == pytest.approx(1500.0, abs=0.01)
     assert p["max_single_loss"] == pytest.approx(-1000.0, abs=0.01)
-    # 翻倍：A +150%；腰斩：B -60%、E -50%
-    assert p["double_count"] == 1
-    assert p["halved_count"] == 2
+    # v2 账户级：v = [1.013, 1.015, 1.005, 1.006]，无翻倍/腰斩事件
+    assert p["double_count"] == 0
+    assert p["halved_count"] == 0
     assert p["unmatched_sell_amount"] == 0.0
-    # 月度盈亏：1 月 +1300、2 月 +200、3 月 -1000、4 月 +100
     assert p["monthly_pnl"] == [
         {"month": "2024-01", "pnl": 1300.0},
         {"month": "2024-02", "pnl": 200.0},
         {"month": "2024-03", "pnl": -1000.0},
         {"month": "2024-04", "pnl": 100.0},
     ]
-    # 累计收益曲线（月末资产近似净值）与最大回撤
-    equity = [pt["equity"] for pt in p["equity_curve"]]
-    assert equity == pytest.approx([101300.0, 101500.0, 100500.0, 100600.0], abs=0.01)
-    assert [pt["month"] for pt in p["equity_curve"]] == [
-        "2024-01",
-        "2024-02",
-        "2024-03",
-        "2024-04",
+    # equity_curve 保留原始净值；收益率曲线（A0=0 → 累计入金基准）
+    assert [pt["equity"] for pt in p["equity_curve"]] == pytest.approx(
+        [101300.0, 101500.0, 100500.0, 100600.0], abs=0.01
+    )
+    assert p["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-12", "return_rate": 0.013},
+        {"month": "2024-02", "date": "2024-02-15", "return_rate": 0.015},
+        {"month": "2024-03", "date": "2024-03-21", "return_rate": 0.005},
+        {"month": "2024-04", "date": "2024-04-25", "return_rate": 0.006},
     ]
-    assert p["equity_curve"][0]["net_value"] == 1.0
-    # 手算最大回撤 = (101500 - 100500) / 101500 = 0.0098522
+    # 最大回撤基于 (1+R)：峰值 1.015 → (1.015-1.005)/1.015
     assert p["max_drawdown"] == pytest.approx(1000 / 101500, abs=1e-4)
-    # 个股盈亏榜
-    top_profit = p["stock_leaderboard"]["top_profit"]
-    top_loss = p["stock_leaderboard"]["top_loss"]
-    assert top_profit[0]["code"] == "A"
-    assert top_profit[0]["total_pnl"] == pytest.approx(1500.0, abs=0.01)
-    assert top_loss[0]["code"] == "E"
-    assert top_loss[0]["total_pnl"] == pytest.approx(-1000.0, abs=0.01)
+    assert p["stock_leaderboard"]["top_profit"][0]["code"] == "A"
+    assert p["stock_leaderboard"]["top_profit"][0]["total_pnl"] == pytest.approx(
+        1500.0, abs=0.01
+    )
+    assert p["stock_leaderboard"]["top_loss"][0]["code"] == "E"
+    assert p["stock_leaderboard"]["top_loss"][0]["total_pnl"] == pytest.approx(
+        -1000.0, abs=0.01
+    )
 
-    # D 行为画像（持仓周期：A 1 天 / B 2 天 / C 7 天 / D 14 天 / E 19 天 / F 35 天）
+    # 完整交易：6 个闭环，字段齐备、状态 closed、红股/特殊操作不进 trades
+    trades = m["trades"]
+    assert len(trades) == 6
+    assert trades[0] == {
+        "code": "A",
+        "name": "A股",
+        "buy_qty": 100.0,
+        "buy_amount": 1000.0,
+        "sell_qty": 100.0,
+        "sell_amount": 2500.0,
+        "pnl": 1500.0,
+        "holding_days": 2,
+        "start_date": "2024-01-02",
+        "end_date": "2024-01-03",
+        "status": "closed",
+    }
+    assert [(t["code"], t["pnl"], t["holding_days"]) for t in trades] == [
+        ("A", 1500.0, 2),
+        ("B", -600.0, 3),
+        ("C", 400.0, 8),
+        ("D", 200.0, 15),
+        ("E", -1000.0, 20),
+        ("F", 100.0, 36),
+    ]
+    assert all(t["status"] == "closed" for t in trades)
+    assert all(set(t) == {
+        "code", "name", "buy_qty", "buy_amount", "sell_qty", "sell_amount",
+        "pnl", "holding_days", "start_date", "end_date", "status",
+    } for t in trades)
+
+    # D 行为画像（持仓周期按完整交易：A 2 / B 3 / C 8 / D 15 / E 20 / F 36 天）
     b = m["behavior"]
     assert b["holding_period_distribution"] == {
-        "le_1d": 1,
-        "2_5d": 1,
+        "le_1d": 0,
+        "2_5d": 2,
         "6_20d": 3,
         "gt_20d": 1,
     }
@@ -228,28 +305,21 @@ def test_full_history_hand_check_pnl_and_behavior():
         {"month": "2024-03", "total_count": 3, "buy_count": 2, "sell_count": 1},
         {"month": "2024-04", "total_count": 1, "buy_count": 0, "sell_count": 1},
     ]
-    # 单票最大仓位：3/1 买入 E 后 2000 / (99500 + 2000) = 0.0197
     assert b["max_position"]["ratio"] == pytest.approx(2000 / 101500, abs=1e-4)
     assert b["max_position"]["code"] == "E"
     assert b["max_position"]["date"] == "2024-03-01"
-    # Top5 成交额集中度 = 12500 / 13600
     assert b["top5_concentration"] == pytest.approx(12500 / 13600, abs=1e-4)
     assert b["favorite_stocks_top10"][0]["code"] == "A"
     assert b["favorite_stocks_top10"][0]["count"] == 2
-    assert b["favorite_stocks_top10"][0]["amount"] == pytest.approx(3500.0, abs=0.01)
-    # 风格初判：平均持仓 13 天 -> 波段；Top5 集中度 0.92 -> 集中；无激进/稳健触发 -> 均衡
-    assert b["style"]["holding_style"] == "波段"
-    assert b["style"]["concentration"] == "集中"
-    assert b["style"]["risk_style"] == "均衡"
     assert b["style"]["label"] == "波段·集中·均衡"
 
 
 # ---------------------------------------------------------------------------
-# FIFO 与费用口径
+# FIFO 与费用口径（完整交易维度）
 # ---------------------------------------------------------------------------
 
 
-def test_fifo_fees_in_cost_and_net_proceeds():
+def test_fifo_fees_in_cost_and_net_proceeds(no_price_fetch):
     trades = [
         T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
         T("X", "X股", "BUY", 100, 10, 1000, 8990, date(2024, 1, 2), fee=10, commission=10),
@@ -259,33 +329,51 @@ def test_fifo_fees_in_cost_and_net_proceeds():
     ]
     m = compute_metrics(trades)
 
-    # 买入费用入成本：lot1 成本 1010（1000+10），lot2 成本 1210；卖出费用扣净额
-    # 卖 1：745 - 505 = +240；卖 2：2240 - (505 + 1210) = +525；合计 +765
+    # 买入费用入成本：lot1 1010、lot2 1210；卖出费用扣净额
+    # 卖 1：745 - 505 = +240；卖 2：2240 - (505 + 1210) = +525；闭环合计 +765
     assert m["pnl"]["realized_pnl"] == pytest.approx(765.0, abs=0.01)
-    assert m["pnl"]["win_count"] == 2
+    # v2 按完整交易统计：X 一次闭环 → 1 胜 0 负
+    assert m["pnl"]["win_count"] == 1
     assert m["pnl"]["loss_count"] == 0
     assert m["pnl"]["win_rate"] == pytest.approx(1.0, abs=1e-4)
     assert m["pnl"]["total_profit"] == pytest.approx(765.0, abs=0.01)
     assert m["pnl"]["profit_loss_ratio"] is None
-    assert m["pnl"]["max_single_profit"] == pytest.approx(525.0, abs=0.01)
+    assert m["pnl"]["max_single_profit"] == pytest.approx(765.0, abs=0.01)
     assert m["account"]["total_cost"] == pytest.approx(35.0, abs=0.01)  # 10+10+5+10
-    assert m["account"]["total_return_rate"] == pytest.approx(0.0765, abs=1e-4)
+    # v2.1 TWR：入金与首买同日（1/2）→ 起始日资产为 0 跳过；
+    # R = 10765 / 9990 − 1 ≈ 0.0776（买入费用计入首日端资产）
+    assert m["account"]["total_return_rate"] == pytest.approx(10765 / 9990 - 1, abs=1e-4)
     assert m["trading"]["total_amount"] == pytest.approx(5200.0, abs=0.01)
 
-    # 平均持仓周期：(50*3 + 50*8 + 100*6) / 200 = 5.75 天
-    assert m["trading"]["avg_holding_period_days"] == pytest.approx(5.75, abs=0.01)
+    # 闭环交易：首买 1/2 → 清仓 1/10（含首尾 9 天）
+    assert m["trades"] == [
+        {
+            "code": "X",
+            "name": "X股",
+            "buy_qty": 200.0,
+            "buy_amount": 2220.0,
+            "sell_qty": 200.0,
+            "sell_amount": 2985.0,
+            "pnl": 765.0,
+            "holding_days": 9,
+            "start_date": "2024-01-02",
+            "end_date": "2024-01-10",
+            "status": "closed",
+        }
+    ]
+    assert m["trading"]["avg_holding_period_days"] == pytest.approx(9.0, abs=0.01)
     assert m["behavior"]["holding_period_distribution"] == {
         "le_1d": 0,
-        "2_5d": 1,
+        "2_5d": 0,
         "6_20d": 1,
         "gt_20d": 0,
     }
-    # X 完整周期收益率 = (2985 - 2220) / 2220 = 34.46%，不触发翻倍/腰斩
+    # 账户级 v = 1.0765，无翻倍/腰斩
     assert m["pnl"]["double_count"] == 0
     assert m["pnl"]["halved_count"] == 0
 
 
-def test_fifo_partial_sell_and_avg_cost_allocation():
+def test_fifo_partial_sell_no_completed_trade(no_price_fetch):
     trades = [
         T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
         T("Y", "Y股", "BUY", 100, 10, 1000, 9000, date(2024, 1, 2)),
@@ -293,13 +381,19 @@ def test_fifo_partial_sell_and_avg_cost_allocation():
         T("Y", "Y股", "SELL", 150, 15, 2250, 9250, date(2024, 1, 10)),
     ]
     m = compute_metrics(trades)
-    # FIFO：先匹配 100@10（成本 1000），再匹配 50@20（成本 1000）
-    # 已实现 = 2250 - 2000 = 250；剩余 50 股成本 1000
+    # FIFO：先匹配 100@10（成本 1000），再匹配 50@20（成本 1000）→ 已实现 250
     assert m["pnl"]["realized_pnl"] == pytest.approx(250.0, abs=0.01)
     assert m["account"]["holding_cost_value"] == pytest.approx(1000.0, abs=0.01)
     assert m["trading"]["current_holding_count"] == 1
-    # 平均持仓：(100*8 + 50*6) / 150 = 7.33 天
-    assert m["trading"]["avg_holding_period_days"] == pytest.approx(7.3333, abs=0.01)
+    # 未清仓：不进完整交易，胜率/持仓周期/分布不计
+    assert m["trades"] == []
+    assert m["pnl"]["win_count"] == 0
+    assert m["pnl"]["loss_count"] == 0
+    assert m["pnl"]["win_rate"] is None
+    assert m["trading"]["avg_holding_period_days"] is None
+    assert m["behavior"]["holding_period_distribution"] == {
+        "le_1d": 0, "2_5d": 0, "6_20d": 0, "gt_20d": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +401,7 @@ def test_fifo_partial_sell_and_avg_cost_allocation():
 # ---------------------------------------------------------------------------
 
 
-def test_mid_history_with_initial_cash_is_partial():
-    # 文件从中间开始：首笔是买入，期初资金 = 5000 - (-1010) = 6010 != 0
+def test_mid_history_with_initial_cash_is_partial(no_price_fetch):
     trades = [
         T("A", "A股", "BUY", 100, 10, 1000, 5000, date(2024, 1, 2), fee=10, commission=10),
         T("", "", "BANK_TO_SEC", 0, 0, 0, 25000, date(2024, 1, 5)),
@@ -322,15 +415,43 @@ def test_mid_history_with_initial_cash_is_partial():
     assert m["account"]["gross_withdraw"] == pytest.approx(0.0, abs=0.01)
     assert m["account"]["opening_asset_value"] == pytest.approx(6010.0, abs=0.01)
     assert m["account"]["ending_balance"] == pytest.approx(26495.0, abs=0.01)
-    # 总收益率（期初资产基准，无期初持仓）= (26495 - 6010 - 20000) / 6010 = 485 / 6010
-    assert m["account"]["total_return_rate"] == pytest.approx(485 / 6010, abs=1e-4)
+    # v2.1 主口径（TWR）：(6000/6010) × (26495/26000) − 1 ≈ 0.0173
+    assert m["account"]["total_return_rate"] == pytest.approx(
+        (6000 / 6010) * (26495 / 26000) - 1, abs=1e-4
+    )
+    # 对照口径（期初资产基准简单收益率）：(26495 - 6010 - 20000) / 6010
+    assert m["account"]["total_return_rate_net"] == pytest.approx(
+        485 / 6010, abs=1e-4
+    )
     assert m["account"]["realized_pnl"] == pytest.approx(485.0, abs=0.01)
     assert m["pnl"]["win_rate"] == pytest.approx(1.0, abs=1e-4)
     assert m["account"]["total_cost"] == pytest.approx(15.0, abs=0.01)
+    # 完整交易闭环：买入成本 1010（含费）、卖出净额 1495、周期盈亏 485
+    assert m["trades"] == [
+        {
+            "code": "A",
+            "name": "A股",
+            "buy_qty": 100.0,
+            "buy_amount": 1010.0,
+            "sell_qty": 100.0,
+            "sell_amount": 1495.0,
+            "pnl": 485.0,
+            "holding_days": 7,
+            "start_date": "2024-01-02",
+            "end_date": "2024-01-08",
+            "status": "closed",
+        }
+    ]
+    # 收益率曲线（v2.1 TWR）：月末累计 R = 0.0173
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-08", "return_rate": 0.0173},
+    ]
+    assert m["pnl"]["double_count"] == 0
+    assert m["pnl"]["halved_count"] == 0
 
 
-def test_mid_history_with_opening_position_is_partial():
-    # 首笔是期初持仓的卖出（无法配对）：已实现盈亏 pnl 中性，只记 unmatched_sell_amount
+def test_mid_history_with_opening_position_is_partial(no_price_fetch):
+    # 首笔是期初持仓的卖出（无法配对）：pnl 中性，只记 unmatched_sell_amount
     trades = [
         T("OLD", "老股", "SELL", 200, 20, 4000, 4000, date(2025, 1, 5)),
         T("OLD", "老股", "BUY", 100, 10, 1000, 3000, date(2025, 1, 6)),
@@ -341,16 +462,36 @@ def test_mid_history_with_opening_position_is_partial():
     assert m["account"]["initial_balance"] == 0.0
     assert m["pnl"]["unmatched_sell_amount"] == pytest.approx(4000.0, abs=0.01)
     assert m["pnl"]["realized_pnl"] == pytest.approx(200.0, abs=0.01)
-    assert m["pnl"]["win_count"] == 1  # 只有配对的卖出计入胜率
+    assert m["pnl"]["win_count"] == 1  # 只有配对的卖出计入完整交易
     assert m["pnl"]["win_rate"] == pytest.approx(1.0, abs=1e-4)
+    # 完整交易只含配对闭环（期初持仓卖出不进 trades）
+    assert m["trades"] == [
+        {
+            "code": "OLD",
+            "name": "老股",
+            "buy_qty": 100.0,
+            "buy_amount": 1000.0,
+            "sell_qty": 100.0,
+            "sell_amount": 1200.0,
+            "pnl": 200.0,
+            "holding_days": 3,
+            "start_date": "2025-01-06",
+            "end_date": "2025-01-08",
+            "status": "closed",
+        }
+    ]
     # 期初资产基准（含期初持仓变现估值 4000）：(4200 - 4000) / 4000 = 5%
     assert m["account"]["opening_asset_value"] == pytest.approx(4000.0, abs=0.01)
     assert m["account"]["total_return_rate"] == pytest.approx(0.05, abs=1e-4)
-    # 纯现金期初基准（期初资金 0 且无净转入）无法计算 -> None
-    assert m["account"]["total_return_rate_net"] is None
+    # v2.1 对照口径 = 期初资产基准简单收益率（A0 = 4000）同样为 5%
+    assert m["account"]["total_return_rate_net"] == pytest.approx(0.05, abs=1e-4)
+    # 首日即期初持仓卖出：合成持仓 1:1 扣减 → r = 0，不产生虚假收益
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2025-01", "date": "2025-01-08", "return_rate": 0.05},
+    ]
 
 
-def test_sell_exceeding_position_marks_partial():
+def test_sell_exceeding_position_marks_partial(no_price_fetch):
     trades = [
         T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
         T("K", "K股", "BUY", 100, 10, 1000, 9000, date(2024, 1, 2)),
@@ -362,14 +503,76 @@ def test_sell_exceeding_position_marks_partial():
     assert m["pnl"]["realized_pnl"] == pytest.approx(200.0, abs=0.01)
     assert m["pnl"]["unmatched_sell_amount"] == pytest.approx(600.0, abs=0.01)
     assert m["trading"]["current_holding_count"] == 0
+    # v2.1 期初持仓合成：A0 = 期初资金 0 + 未配对卖出变现 600；
+    # 首日入金 r=0、买入日 r=0，卖出日 (10800 − 10600)/10600 = 200/10600
+    assert m["account"]["opening_asset_value"] == pytest.approx(600.0, abs=0.01)
+    assert m["account"]["total_return_rate"] == pytest.approx(
+        round(200 / 10600, 4), abs=1e-6
+    )
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-03", "return_rate": 0.0189},
+    ]
+    # 配对部分构成一个完整闭环（卖出数量只记配对部分）
+    assert m["trades"] == [
+        {
+            "code": "K",
+            "name": "K股",
+            "buy_qty": 100.0,
+            "buy_amount": 1000.0,
+            "sell_qty": 100.0,
+            "sell_amount": 1200.0,
+            "pnl": 200.0,
+            "holding_days": 2,
+            "start_date": "2024-01-02",
+            "end_date": "2024-01-03",
+            "status": "closed",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
-# 拆分红股 / 多周期 / 特殊操作
+# 红股 / 多周期 / 特殊操作（完整交易剔除）
 # ---------------------------------------------------------------------------
 
 
-def test_bonus_share_dilutes_cost_basis():
+def test_bonus_share_dilutes_cost_and_trade_uses_buy_qty_only(no_price_fetch):
+    # 全清仓闭环：买 100（成本 1000）+ 红股 50（零成本摊薄）+ 卖 150
+    trades = [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
+        T("G", "G股", "BUY", 100, 10, 1000, 9000, date(2024, 1, 2)),
+        T("G", "G股", "BONUS_SHARE", 50, 0, 0, 9000, date(2024, 3, 1)),
+        T("G", "G股", "SELL", 150, 15, 2250, 11250, date(2024, 5, 1)),
+    ]
+    m = compute_metrics(trades)
+    assert m["pnl"]["realized_pnl"] == pytest.approx(1250.0, abs=0.01)
+    assert m["account"]["holding_cost_value"] == 0.0
+    assert m["trading"]["current_holding_count"] == 0
+    assert m["pnl"]["win_count"] == 1
+    # 红股不进 trades：buy_qty 只记实际买入 100，卖出 150（含红股）
+    assert m["trades"] == [
+        {
+            "code": "G",
+            "name": "G股",
+            "buy_qty": 100.0,
+            "buy_amount": 1000.0,
+            "sell_qty": 150.0,
+            "sell_amount": 2250.0,
+            "pnl": 1250.0,
+            "holding_days": 121,
+            "start_date": "2024-01-02",
+            "end_date": "2024-05-01",
+            "status": "closed",
+        }
+    ]
+    assert m["behavior"]["holding_period_distribution"]["gt_20d"] == 1
+    assert m["behavior"]["special_operations"]["bonus_share"] == {
+        "count": 1, "qty": 50.0,
+    }
+    assert m["trading"]["avg_holding_period_days"] == pytest.approx(121.0, abs=0.01)
+
+
+def test_bonus_share_partial_sell_not_closed(no_price_fetch):
+    # 买 100 + 红股 50 → 150 股；只卖 120 → 未清仓，不计胜率/持仓周期
     trades = [
         T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
         T("G", "G股", "BUY", 100, 10, 1000, 9000, date(2024, 1, 2)),
@@ -377,20 +580,18 @@ def test_bonus_share_dilutes_cost_basis():
         T("G", "G股", "SELL", 120, 15, 1800, 10800, date(2024, 5, 1)),
     ]
     m = compute_metrics(trades)
-    # 红股入账后 100 -> 150 股，成本仍为 1000（每股 6.6667）
-    # 卖出 120 股成本 800，已实现 = 1800 - 800 = 1000；剩余 30 股成本 200
+    # 已实现 = 1800 - 1000*120/150 = 1000；剩余 30 股成本 200
     assert m["pnl"]["realized_pnl"] == pytest.approx(1000.0, abs=0.01)
     assert m["account"]["holding_cost_value"] == pytest.approx(200.0, abs=0.01)
     assert m["trading"]["current_holding_count"] == 1
-    assert m["behavior"]["special_operations"]["bonus_share"] == {"count": 1, "qty": 50.0}
-    # 持仓 120 天 -> >20 天桶
-    assert m["behavior"]["holding_period_distribution"]["gt_20d"] == 1
-    # 未平仓周期按成本估算（成本兜底 -> 收益率 0，不触发翻倍/腰斩）
+    assert m["trades"] == []
+    assert m["pnl"]["win_count"] == 0
+    assert m["trading"]["avg_holding_period_days"] is None
     assert m["pnl"]["double_count"] == 0
     assert m["pnl"]["halved_count"] == 0
 
 
-def test_multi_cycle_double_count():
+def test_multi_cycle_closed_trades(no_price_fetch):
     trades = [
         T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
         T("M", "M股", "BUY", 100, 10, 1000, 9000, date(2024, 1, 2)),
@@ -399,15 +600,21 @@ def test_multi_cycle_double_count():
         T("M", "M股", "SELL", 100, 26, 2600, 13100, date(2024, 1, 5)),
     ]
     m = compute_metrics(trades)
-    # 两个完整周期：+150% 与 +160%，均翻倍
-    assert m["pnl"]["double_count"] == 2
-    assert m["pnl"]["halved_count"] == 0
+    # 两个完整周期：+150% 与 +160%（个股维度），账户级 v=1.31 无翻倍
+    assert len(m["trades"]) == 2
+    assert [(t["pnl"], t["holding_days"]) for t in m["trades"]] == [
+        (1500.0, 2), (1600.0, 2),
+    ]
     assert m["pnl"]["realized_pnl"] == pytest.approx(3100.0, abs=0.01)
+    assert m["pnl"]["win_count"] == 2
     assert m["pnl"]["win_rate"] == pytest.approx(1.0, abs=1e-4)
-    assert m["behavior"]["holding_period_distribution"]["le_1d"] == 2
+    assert m["pnl"]["double_count"] == 0
+    assert m["pnl"]["halved_count"] == 0
+    assert m["behavior"]["holding_period_distribution"]["2_5d"] == 2
+    assert m["trading"]["avg_holding_period_days"] == pytest.approx(2.0, abs=0.01)
 
 
-def test_special_operations_excluded_from_equity_stats():
+def test_special_operations_excluded_from_trades_and_stats(no_price_fetch):
     trades = [
         T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
         T("131810", "R-001", "REPO", 40, 2.525, 4000, 5999.9, date(2024, 1, 3), fee=0.1),
@@ -426,17 +633,253 @@ def test_special_operations_excluded_from_equity_stats():
     assert sp["interest"] == {"count": 1, "amount": pytest.approx(1.2, abs=0.01)}
     assert sp["other"]["count"] == 1
     assert sp["ipo"] == {"count": 0, "amount": 0.0}
-    # 逆回购/分红/利息/指定交易不进入股票成交统计
+    # 逆回购/分红/利息/指定交易/转账不进入股票成交统计
     assert m["trading"]["total_count"] == 2
     assert m["trading"]["total_amount"] == pytest.approx(2200.0, abs=0.01)
     assert m["trading"]["distinct_stock_count"] == 1
     assert m["pnl"]["realized_pnl"] == pytest.approx(200.0, abs=0.01)
     assert m["account"]["ending_balance"] == pytest.approx(6250.5, abs=0.01)
     assert m["account"]["total_cost"] == pytest.approx(0.1, abs=0.01)
+    # 完整交易只含 H 的闭环，特殊操作一行都不进 trades
+    assert len(m["trades"]) == 1
+    assert m["trades"][0]["code"] == "H"
+    assert m["trades"][0]["pnl"] == pytest.approx(200.0, abs=0.01)
+    assert m["trades"][0]["holding_days"] == 3
+    # v2.1 TWR：逆回购本金 4000 按 1:1 应收款跟踪（价值中性，仍属资产），
+    # 仅费用/分红/利息/买卖盈亏计收益：R = 10250.5 / 10000 − 1 = 0.0251
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-09", "return_rate": 0.0251},
+    ]
 
 
 # ---------------------------------------------------------------------------
-# akshare 估值：成功 / 失败兜底 / 部分成功
+# 收益率曲线 / 账户级翻倍腰斩（v2.1 1.0 / 1.4 TWR 逐日模拟）
+# ---------------------------------------------------------------------------
+
+
+def test_return_curve_twr_with_transfer_day(no_price_fetch):
+    """A0=0 完整历史 + 中途转账日：v2.1 逐日 TWR 手算。
+
+    逐日 v 序列：[1.0, 1.5, 1.5, 1.5, 0.825, 0.825, 1.95, 1.95, 1.5]；
+    2/1 转账 5000（余额 15000→20000）日 r = (20000−5000−15000)/15000 = 0，
+    出入金不产生收益；最终 R = 0.5；峰值 1.95 < 2 无翻倍，
+    最低 0.825 > 0.75(=0.5×1.5) 无腰斩；最大回撤 (1.5−0.825)/1.5 = 0.45。
+    """
+    m = compute_metrics(_deposit_basis_double_halved_trades())
+    assert m["meta"]["is_partial"] is False
+    assert m["account"]["opening_asset_value"] == 0.0
+
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-05", "return_rate": 0.5},
+        {"month": "2024-02", "date": "2024-02-10", "return_rate": -0.175},
+        {"month": "2024-03", "date": "2024-03-10", "return_rate": 0.95},
+        {"month": "2024-04", "date": "2024-04-10", "return_rate": 0.5},
+    ]
+    assert m["pnl"]["double_count"] == 0
+    assert m["pnl"]["halved_count"] == 0
+    assert m["pnl"]["max_drawdown"] == pytest.approx((1.5 - 0.825) / 1.5, abs=1e-4)
+    assert m["account"]["total_return_rate"] == pytest.approx(0.5, abs=1e-4)
+    # 对照口径：期初资产基准简单收益率 = (20000 − 15000) / 15000
+    assert m["account"]["total_return_rate_net"] == pytest.approx(1 / 3, abs=1e-4)
+    # 完整交易与胜率/盈亏比
+    assert [(t["code"], t["pnl"], t["holding_days"]) for t in m["trades"]] == [
+        ("A", 5000.0, 3),
+        ("B", -9000.0, 6),
+        ("C", 15000.0, 9),
+        ("D", -6000.0, 9),
+    ]
+    assert m["pnl"]["win_count"] == 2
+    assert m["pnl"]["loss_count"] == 2
+    assert m["pnl"]["win_rate"] == pytest.approx(0.5, abs=1e-4)
+    assert m["pnl"]["total_profit"] == pytest.approx(20000.0, abs=0.01)
+    assert m["pnl"]["total_loss"] == pytest.approx(15000.0, abs=0.01)
+    assert m["pnl"]["profit_loss_ratio"] == pytest.approx(4 / 3, abs=1e-4)
+    assert m["pnl"]["max_single_profit"] == pytest.approx(15000.0, abs=0.01)
+    assert m["pnl"]["max_single_loss"] == pytest.approx(-9000.0, abs=0.01)
+    assert m["trading"]["avg_holding_period_days"] == pytest.approx(6.75, abs=0.01)
+    assert m["pnl"]["monthly_pnl"] == [
+        {"month": "2024-01", "pnl": 5000.0},
+        {"month": "2024-02", "pnl": -9000.0},
+        {"month": "2024-03", "pnl": 15000.0},
+        {"month": "2024-04", "pnl": -6000.0},
+    ]
+
+
+def test_return_curve_twr_opening_position_synthetic(no_price_fetch):
+    """A0>0 期初持仓合成：首日卖出期初持仓 r=0，合成持仓 1:1 不产生虚假收益。
+
+    逐日：1/5 卖期初 200 股（A0=4000 合成，r=0）→ 2/3 入金 10000（r=0）→
+    3/2 买入（r=0）→ 3/5 卖出（r=5000/14000）；R = 3/7 ≈ 0.3571。
+    """
+    m = compute_metrics(_opening_asset_basis_trades())
+    assert m["meta"]["is_partial"] is True
+    assert m["account"]["opening_asset_value"] == pytest.approx(4000.0, abs=0.01)
+    assert m["pnl"]["unmatched_sell_amount"] == pytest.approx(4000.0, abs=0.01)
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2025-01", "date": "2025-01-05", "return_rate": 0.0},
+        {"month": "2025-02", "date": "2025-02-03", "return_rate": 0.0},
+        {"month": "2025-03", "date": "2025-03-05", "return_rate": 0.3571},
+    ]
+    assert m["pnl"]["double_count"] == 0
+    assert m["pnl"]["halved_count"] == 0
+    assert m["pnl"]["max_drawdown"] == 0.0
+    assert m["account"]["total_return_rate"] == pytest.approx(5 / 14, abs=1e-4)
+    # 对照口径（期初资产基准简单收益率）：(19000 − 4000 − 10000) / 4000 = 1.25
+    assert m["account"]["total_return_rate_net"] == pytest.approx(1.25, abs=1e-4)
+    assert m["trades"] == [
+        {
+            "code": "N",
+            "name": "N股",
+            "buy_qty": 100.0,
+            "buy_amount": 5000.0,
+            "sell_qty": 100.0,
+            "sell_amount": 10000.0,
+            "pnl": 5000.0,
+            "holding_days": 4,
+            "start_date": "2025-03-02",
+            "end_date": "2025-03-05",
+            "status": "closed",
+        }
+    ]
+
+
+def test_return_curve_fills_months_without_records(no_price_fetch):
+    trades = [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
+        T("A", "A股", "BUY", 100, 10, 1000, 9000, date(2024, 1, 2)),
+        T("A", "A股", "SELL", 100, 12, 1200, 10200, date(2024, 1, 3)),
+        T("B", "B股", "BUY", 100, 10, 1000, 9200, date(2024, 4, 1)),
+    ]
+    m = compute_metrics(trades)
+    # 2/3 月无记录：沿用 1 月末余额/持仓成本，快照日为月末最后一天
+    assert [pt["month"] for pt in m["pnl"]["return_curve"]] == [
+        "2024-01", "2024-02", "2024-03", "2024-04",
+    ]
+    assert m["pnl"]["return_curve"][1] == {
+        "month": "2024-02", "date": "2024-02-29", "return_rate": 0.02,
+    }
+    assert m["pnl"]["return_curve"][2] == {
+        "month": "2024-03", "date": "2024-03-31", "return_rate": 0.02,
+    }
+    assert m["pnl"]["return_curve"][0]["date"] == "2024-01-03"
+    assert m["pnl"]["return_curve"][3]["date"] == "2024-04-01"
+    assert len(m["pnl"]["equity_curve"]) == 4
+
+
+def test_twr_transfers_do_not_affect_return(no_price_fetch):
+    """v2.1：出入金只影响 r_d 分子（转账日收益率为 0），
+    等额同日出入金对 TWR 无影响。"""
+    base = [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
+        T("A", "A股", "BUY", 100, 10, 1000, 9000, date(2024, 1, 3)),
+        T("A", "A股", "SELL", 100, 12, 1200, 10200, date(2024, 1, 4)),
+    ]
+    with_roundtrip = base + [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 110200, date(2024, 1, 5)),
+        T("", "", "SEC_TO_BANK", 0, 0, 0, 10200, date(2024, 1, 5)),
+    ]
+    m1 = compute_metrics(base)
+    m2 = compute_metrics(with_roundtrip)
+    # 两个场景 TWR 完全一致：入金 10 万 + 同日出金 10 万，r_d = 0
+    assert m1["account"]["total_return_rate"] == pytest.approx(0.02, abs=1e-6)
+    assert m2["account"]["total_return_rate"] == pytest.approx(0.02, abs=1e-6)
+    assert m2["pnl"]["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-05", "return_rate": 0.02},
+    ]
+    # 出入金字段照常累计（对照口径简单收益率会不同，但主口径 TWR 不变）
+    assert m2["account"]["net_transfer_in"] == pytest.approx(10000.0, abs=0.01)
+    assert m2["account"]["gross_deposit"] == pytest.approx(110000.0, abs=0.01)
+    assert m2["account"]["gross_withdraw"] == pytest.approx(100000.0, abs=0.01)
+
+
+def test_twr_double_and_halved_events(no_price_fetch):
+    """v2.1 1.4：翻倍 = R 从 < 100% 升到 ≥ 100% 的独立事件；
+    腰斩 = v ≤ 0.5 × v_peak 的独立事件（创新高重置，回升过半腰线后重新计数）。
+
+    手算逐日 v：1.0 → 2.0（翻倍#1）→ 1.75 → 2.55（翻倍#2，R 0.75→1.55）
+    → 1.05（腰斩#1，≤ 0.5×2.55=1.275）→ 1.3 → 1.5 → 1.1（腰斩#2）；
+    最终 R = 0.1；最大回撤 = (2.55 − 1.05) / 2.55。
+    """
+    trades = [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
+        T("A", "A股", "BUY", 100, 10, 1000, 9000, date(2024, 1, 3)),
+        T("A", "A股", "SELL", 100, 110, 11000, 20000, date(2024, 1, 4)),
+        T("B", "B股", "BUY", 100, 50, 5000, 15000, date(2024, 1, 5)),
+        T("B", "B股", "SELL", 100, 25, 2500, 17500, date(2024, 1, 6)),
+        T("C", "C股", "BUY", 100, 80, 8000, 9500, date(2024, 1, 7)),
+        T("C", "C股", "SELL", 100, 160, 16000, 25500, date(2024, 1, 8)),
+        T("D", "D股", "BUY", 100, 200, 20000, 5500, date(2024, 1, 9)),
+        T("D", "D股", "SELL", 100, 50, 5000, 10500, date(2024, 1, 10)),
+        T("E", "E股", "BUY", 100, 30, 3000, 7500, date(2024, 1, 11)),
+        T("E", "E股", "SELL", 100, 55, 5500, 13000, date(2024, 1, 12)),
+        T("G", "G股", "BUY", 100, 60, 6000, 7000, date(2024, 1, 15)),
+        T("G", "G股", "SELL", 100, 80, 8000, 15000, date(2024, 1, 16)),
+        T("H", "H股", "BUY", 100, 80, 8000, 7000, date(2024, 1, 17)),
+        T("H", "H股", "SELL", 100, 40, 4000, 11000, date(2024, 1, 18)),
+    ]
+    m = compute_metrics(trades)
+    assert m["pnl"]["double_count"] == 2
+    assert m["pnl"]["halved_count"] == 2
+    assert m["account"]["total_return_rate"] == pytest.approx(0.1, abs=1e-6)
+    assert m["pnl"]["max_drawdown"] == pytest.approx((2.55 - 1.05) / 2.55, abs=1e-4)
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-18", "return_rate": 0.1},
+    ]
+
+
+def test_first_row_sec_to_bank_counts_withdrawal(no_price_fetch):
+    """M6：首行「证券转银行」——出金计入净转入/累计出金，期初资金 = 余额 + 出金额。
+
+    期初资金 = 8000 + 2000 = 10000；首日 r = (8000 − (−2000) − 10000)/10000 = 0；
+    后续买入日 r=0、卖出日 r = 200/8000 = 0.025。
+    """
+    trades = [
+        T("", "", "SEC_TO_BANK", 0, 0, 2000, 8000, date(2024, 1, 2)),
+        T("A", "A股", "BUY", 100, 10, 1000, 7000, date(2024, 1, 3)),
+        T("A", "A股", "SELL", 100, 12, 1200, 8200, date(2024, 1, 5)),
+    ]
+    m = compute_metrics(trades)
+    assert m["account"]["initial_balance"] == pytest.approx(10000.0, abs=0.01)
+    assert m["account"]["net_transfer_in"] == pytest.approx(-2000.0, abs=0.01)
+    assert m["account"]["gross_deposit"] == pytest.approx(0.0, abs=0.01)
+    assert m["account"]["gross_withdraw"] == pytest.approx(2000.0, abs=0.01)
+    assert m["account"]["opening_asset_value"] == pytest.approx(10000.0, abs=0.01)
+    assert m["account"]["total_return_rate"] == pytest.approx(0.025, abs=1e-6)
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-05", "return_rate": 0.025},
+    ]
+
+
+def test_top_loss_ascending_top_profit_descending(no_price_fetch):
+    trades = [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 100000, date(2024, 1, 2)),
+        T("P", "P股", "BUY", 100, 10, 1000, 99000, date(2024, 1, 3)),
+        T("P", "P股", "SELL", 100, 5, 500, 99500, date(2024, 1, 4)),
+        T("Q", "Q股", "BUY", 100, 20, 2000, 97500, date(2024, 1, 5)),
+        T("Q", "Q股", "SELL", 100, 10, 1000, 98500, date(2024, 1, 6)),
+        T("R", "R股", "BUY", 100, 30, 3000, 95500, date(2024, 1, 7)),
+        T("R", "R股", "SELL", 100, 28, 2800, 98300, date(2024, 1, 8)),
+        T("S", "S股", "BUY", 100, 10, 1000, 97300, date(2024, 1, 9)),
+        T("S", "S股", "SELL", 100, 13, 1300, 98600, date(2024, 1, 10)),
+        T("T", "T股", "BUY", 100, 10, 1000, 97600, date(2024, 1, 11)),
+        T("T", "T股", "SELL", 100, 11, 1100, 98700, date(2024, 1, 12)),
+    ]
+    m = compute_metrics(trades)
+    top_loss = m["pnl"]["stock_leaderboard"]["top_loss"]
+    top_profit = m["pnl"]["stock_leaderboard"]["top_profit"]
+    # 亏损榜升序（亏损最多在前）：Q -1000 → P -500 → R -200
+    assert [(x["code"], x["total_pnl"]) for x in top_loss] == [
+        ("Q", -1000.0), ("P", -500.0), ("R", -200.0),
+    ]
+    # 盈利榜降序：S +300 → T +100
+    assert [(x["code"], x["total_pnl"]) for x in top_profit] == [
+        ("S", 300.0), ("T", 100.0),
+    ]
+    assert len(m["trades"]) == 5
+
+
+# ---------------------------------------------------------------------------
+# akshare 估值：成功 / 失败兜底 / 部分成功（账户级翻倍腰斩与个股无关）
 # ---------------------------------------------------------------------------
 
 
@@ -458,13 +901,14 @@ def test_akshare_live_price_success(monkeypatch):
     a = m["account"]
     assert a["market_value_source"] == "akshare"
     assert a["valuation_date"] is not None
-    # 市值 = 100*25 + 100*8 = 3300；成本 3000；浮动盈亏 +300
     assert a["holding_market_value"] == pytest.approx(3300.0, abs=0.01)
     assert a["holding_cost_value"] == pytest.approx(3000.0, abs=0.01)
     assert a["unrealized_pnl"] == pytest.approx(300.0, abs=0.01)
-    # 未平仓周期按最新价估算：ZZZ +150%（翻倍），WWW -60%（腰斩）
-    assert m["pnl"]["double_count"] == 1
-    assert m["pnl"]["halved_count"] == 1
+    # 未清仓不计胜率；账户级 v=1.0 无翻倍/腰斩（个股 ±150% 不参与）
+    assert m["pnl"]["win_count"] == 0
+    assert m["pnl"]["double_count"] == 0
+    assert m["pnl"]["halved_count"] == 0
+    assert m["trades"] == []
 
 
 def test_akshare_failure_falls_back_to_cost(monkeypatch):
@@ -490,10 +934,9 @@ def test_akshare_partial_price_map(monkeypatch):
     m = compute_metrics(_open_position_trades())
     a = m["account"]
     assert a["market_value_source"] == "akshare"
-    # ZZZ 用实时价 25，WWW 按成本 20 兜底
     assert a["holding_market_value"] == pytest.approx(4500.0, abs=0.01)
     assert a["unrealized_pnl"] == pytest.approx(1500.0, abs=0.01)
-    assert m["pnl"]["double_count"] == 1
+    assert m["pnl"]["double_count"] == 0
     assert m["pnl"]["halved_count"] == 0
 
 
@@ -512,8 +955,8 @@ def test_price_fetch_fallback_chain(monkeypatch):
     assert a["market_value_source"] == "akshare"
     assert a["holding_market_value"] == pytest.approx(3300.0, abs=0.01)
     assert a["unrealized_pnl"] == pytest.approx(300.0, abs=0.01)
-    assert m["pnl"]["double_count"] == 1
-    assert m["pnl"]["halved_count"] == 1
+    assert m["pnl"]["double_count"] == 0
+    assert m["pnl"]["halved_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +964,7 @@ def test_price_fetch_fallback_chain(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_json_schema_snake_case_and_serializable():
+def test_json_schema_snake_case_and_serializable(no_price_fetch):
     m = compute_metrics(_full_history_trades())
     pattern = re.compile(r"^[a-z0-9_]+$")
 
@@ -539,9 +982,13 @@ def test_json_schema_snake_case_and_serializable():
     assert json.loads(payload) == m.to_dict()
     assert isinstance(m, MetricsResult)
     assert m["meta"]["is_partial"] is False
+    # v2 新字段就位
+    assert len(m["trades"]) == 6
+    assert len(m["pnl"]["return_curve"]) == 4
+    assert isinstance(m["stocks"], list) and len(m["stocks"]) == 6
 
 
-def test_empty_trades():
+def test_empty_result_has_v2_fields():
     m = compute_metrics([])
     assert m["meta"]["is_partial"] is False
     assert m["meta"]["start_date"] is None
@@ -549,11 +996,17 @@ def test_empty_trades():
     assert m["account"]["total_return_rate"] is None
     assert m["pnl"]["win_rate"] is None
     assert m["trading"]["total_count"] == 0
+    assert m["trading"]["avg_holding_period_days"] is None
     assert m["pnl"]["monthly_pnl"] == []
+    assert m["pnl"]["equity_curve"] == []
+    assert m["pnl"]["return_curve"] == []
+    assert m["trades"] == []
+    assert m["stocks"] == []
+    assert m["pnl"]["stock_leaderboard"] == {"top_profit": [], "top_loss": []}
     json.dumps(m, allow_nan=False)
 
 
-def test_date_format_tolerance_and_stable_order():
+def test_date_format_tolerance_and_stable_order(no_price_fetch):
     trades = [
         T("D1", "D1股", "BUY", 100, 10, 1000, 9000, "20240102"),
         T("D2", "D2股", "BUY", 100, 10, 1000, 8000, 20240102),
@@ -564,6 +1017,7 @@ def test_date_format_tolerance_and_stable_order():
     assert m["meta"]["end_date"] == "2024-01-02"
     assert m["trading"]["total_count"] == 3
     assert m["trading"]["current_holding_count"] == 3
+    assert m["trades"] == []
 
 
 def test_duck_typed_records_without_balance():
@@ -588,17 +1042,24 @@ def test_duck_typed_records_without_balance():
         ),
     ]
     m = compute_metrics(trades)
-    # 余额缺失时按成交金额 ± 费用兜底现金流
     assert m["pnl"]["realized_pnl"] == pytest.approx(200.0, abs=0.01)
     assert m["pnl"]["win_rate"] == pytest.approx(1.0, abs=1e-4)
     assert m["trading"]["total_amount"] == pytest.approx(2200.0, abs=0.01)
+    assert len(m["trades"]) == 1
+    assert m["trades"][0]["pnl"] == pytest.approx(200.0, abs=0.01)
+    assert m["trades"][0]["holding_days"] == 3
+    # 无资金余额且无入金记录：A0=0 且 Σd=0，收益率未定义
+    assert m["pnl"]["return_curve"][0]["return_rate"] is None
+    assert m["account"]["total_return_rate"] is None
 
 
-def test_parser_contract_records_work_with_metrics():
+def test_parser_contract_records_work_with_metrics(no_price_fetch):
     """parser 已落地：用真实 TradeRecord + OpType 枚举验证集成。"""
     if not PARSER_AVAILABLE:
         pytest.skip("parser 未落地，跳过集成测试")
     m = compute_metrics(_full_history_trades())
-    assert m["pnl"]["double_count"] == 1
-    assert m["pnl"]["halved_count"] == 2
+    assert m["pnl"]["double_count"] == 0
+    assert m["pnl"]["halved_count"] == 0
+    assert len(m["trades"]) == 6
+    assert len(m["pnl"]["return_curve"]) == 4
     assert m["account"]["total_return_rate"] == pytest.approx(0.006, abs=1e-4)

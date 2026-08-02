@@ -9,6 +9,7 @@ import shutil
 import sys
 import uuid
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -107,7 +108,7 @@ STUB_METRICS = {
     "sell_count": 50,
     "win_rate": 0.52,
     "profit_loss_ratio": 1.3,
-    "max_drawdown": -0.21,
+    "max_drawdown": 0.21,
     "avg_holding_days": 4.5,
     "turnover_rate": 8.2,
     "trade_stock_count": 22,
@@ -198,6 +199,30 @@ def test_build_profile_sanitized():
     assert "contract_no" not in profile and "balance" not in profile
 
 
+def test_build_profile_ratio_fields_formatting():
+    """对照数据字典：盈亏比 → `1 : N`；资金周转率（倍）不做 ×100；胜率/回撤仍为百分比。"""
+    profile = build_profile(STUB_TRADES, STUB_METRICS)
+    # M3：盈亏比用 1 : N（1.3 → N = 1.3），绝不输出百分比
+    assert "盈亏比：1 : 1.30" in profile
+    assert "130.0%" not in profile
+    # 资金周转率单位是「倍」（总成交额 ÷ 平均资金余额），不做 ×100
+    assert "资金周转率：8.2" in profile
+    assert "820.0%" not in profile
+    # 正确字段仍 ×100：胜率（小数 0.52）、最大回撤（正值 0.21）
+    assert "胜率：52.0%" in profile
+    assert "最大回撤：21.0%" in profile
+
+
+def test_profit_loss_ratio_1n_format():
+    """盈亏比 1 : N 格式：1.33 → "1 : 1.33"；0.957 → N = 1/0.957 ≈ 1.04。"""
+    summary = analyst._metrics_summary({"profit_loss_ratio": 1.33})
+    assert ("盈亏比", "1 : 1.33") in summary
+    summary = analyst._metrics_summary({"profit_loss_ratio": 0.957})
+    assert ("盈亏比", "1 : 1.04") in summary
+    # 无亏损 → None：摘要中不展示，也不报错
+    assert analyst._metrics_summary({"profit_loss_ratio": None}) == []
+
+
 def test_build_profile_accepts_objects():
     class StubTrade:
         def __init__(self, d):
@@ -275,6 +300,49 @@ def test_rule_tags_generated():
     assert tags
     assert "短线波段" in tags  # style
 
+
+def test_rule_engine_positive_drawdown_triggers_risk():
+    """M4：真实指标（正值最大回撤 0.5，数据字典 v2 语义）驱动，触发「回撤凶猛」标签与风险提示。
+
+    累计入金 10000：1 月盈利后余额 15000（R=0.5，v=1.5）；2 月亏损后余额 7500
+    （R=-0.25，v=0.75）。最大回撤 = (1.5 - 0.75) / 1.5 = 0.5。
+    """
+    from synalysis_crew import OpType, TradeRecord
+    from synalysis_crew.metrics import compute_metrics
+
+    trades = [
+        TradeRecord(code="", name="", op_type=OpType.BANK_TO_SEC, qty=0.0, price=0.0,
+                    amount=0.0, balance=10000.0, trade_date=date(2024, 1, 2),
+                    currency="人民币"),
+        TradeRecord(code="A", name="A股", op_type=OpType.BUY, qty=100.0, price=50.0,
+                    amount=5000.0, balance=5000.0, trade_date=date(2024, 1, 3),
+                    currency="人民币"),
+        TradeRecord(code="A", name="A股", op_type=OpType.SELL, qty=100.0, price=100.0,
+                    amount=10000.0, balance=15000.0, trade_date=date(2024, 1, 5),
+                    currency="人民币"),
+        TradeRecord(code="B", name="B股", op_type=OpType.BUY, qty=100.0, price=100.0,
+                    amount=10000.0, balance=5000.0, trade_date=date(2024, 2, 5),
+                    currency="人民币"),
+        TradeRecord(code="B", name="B股", op_type=OpType.SELL, qty=100.0, price=25.0,
+                    amount=2500.0, balance=7500.0, trade_date=date(2024, 2, 10),
+                    currency="人民币"),
+    ]
+    metrics = compute_metrics(trades)  # 无期末持仓，全程离线
+    assert metrics["pnl"]["max_drawdown"] == pytest.approx(0.5, abs=1e-4)
+
+    # 正值回撤 >= 0.2 触发「回撤凶猛」标签
+    tags = rule_tags(metrics)
+    assert "回撤凶猛" in tags
+
+    # 规则引擎风险提示分支同步触发
+    risks = analyst._risk_lines(metrics)
+    assert "历史最大回撤较深，注意单票集中与仓位控制。" in risks
+
+    # 降级报告全文包含该风险提示与回撤事实（overall_tags 由 graph 合并分析师标签，
+    # 「回撤凶猛」属 rule_tags 兜底标签，直接断言规则引擎与报告正文）
+    result = analyze(trades, metrics, max_rounds=0)
+    assert "历史最大回撤较深" in result["final_report"]
+    assert "最大回撤50.0%" in result["final_report"]
 
 # ── graph.py：analyze() 无 Key 降级全流程 ──
 

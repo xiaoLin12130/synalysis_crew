@@ -7,9 +7,11 @@
 """
 
 import json
+import math
 import os
 import re
 import shutil
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -85,10 +87,10 @@ _METRIC_LABELS = [
     ("avg_holding_period_days", "平均持仓周期"),
 ]
 
-# 百分比类键（格式化时转成 %）
+# 百分比类键（格式化时转成 %）。注意：盈亏比（1 : N）与资金周转率（倍）不属于百分比字段。
 _PCT_KEYS = (
-    "return", "annual", "win", "drawdown", "turnover", "ratio",
-    "收益率", "年化", "胜率", "回撤", "周转", "盈亏比", "占比", "集中度",
+    "return", "annual", "win", "drawdown", "ratio",
+    "收益率", "年化", "胜率", "回撤", "占比", "集中度",
 )
 
 
@@ -180,6 +182,23 @@ def _fmt_pct(v) -> str:
     s = str(v)
     return s if s.endswith("%") else s
 
+
+def _fmt_profit_loss_ratio(v) -> str:
+    """盈亏比按 `1 : N` 展示（数据字典：总盈利 ÷ 总亏损，前端 1 : N）。
+
+    N 取 max(ratio, 1/ratio) 并四舍五入两位：1.33 → "1 : 1.33"；0.957 → "1 : 1.04"。
+    绝不做百分比（×100）输出。
+    """
+    if isinstance(v, bool):
+        return str(v)
+    try:
+        r = float(v)
+    except (TypeError, ValueError):
+        return _fmt_num(v)
+    if not math.isfinite(r) or r <= 0:
+        return _fmt_num(v)
+    n = r if r >= 1 else 1.0 / r
+    return f"1 : {Decimal(str(n)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}"
 
 # ───────────────────────── Skill 加载 ─────────────────────────
 
@@ -332,11 +351,12 @@ def _metrics_summary(metrics: dict) -> list[tuple[str, str]]:
                     continue
                 ordered.append((label, text))
             elif isinstance(v, (str, int, float, bool)):
-                value = (
-                    _fmt_pct(v)
-                    if any(p in (label or canonical) for p in _PCT_KEYS)
-                    else _fmt_num(v)
-                )
+                if canonical == "profit_loss_ratio":
+                    value = _fmt_profit_loss_ratio(v)
+                elif any(p in (label or canonical) for p in _PCT_KEYS):
+                    value = _fmt_pct(v)
+                else:
+                    value = _fmt_num(v)
                 ordered.append((label, value))
             used.add(k)
             break
@@ -710,7 +730,7 @@ def rule_tags(metrics: dict) -> list[str]:
             pass
     if facts["drawdown"] is not None:
         try:
-            if float(facts["drawdown"]) <= -0.2:
+            if float(facts["drawdown"]) >= 0.2:
                 tags.append("回撤凶猛")
         except Exception:
             pass
@@ -770,7 +790,7 @@ def _risk_lines(metrics: dict) -> list[str]:
     risks = ["市场有风险，历史交易数据不代表未来表现，请独立判断。"]
     if facts["drawdown"] is not None:
         try:
-            if float(facts["drawdown"]) <= -0.2:
+            if float(facts["drawdown"]) >= 0.2:
                 risks.append("历史最大回撤较深，注意单票集中与仓位控制。")
         except Exception:
             pass

@@ -64,7 +64,7 @@ for _path in (_SRC, _FIXTURES):
 import pytest  # noqa: E402
 
 from synthetic_trades import STANDARD_HEADERS, build_xlsx, make_trades  # noqa: E402
-from synalysis_crew import OpType, ParseError, parse_trades  # noqa: E402
+from synalysis_crew import OpType, ParseError, TradeRecord, parse_trades  # noqa: E402
 from synalysis_crew import storage  # noqa: E402
 from synalysis_crew.analyst import DISCLAIMER, build_profile  # noqa: E402
 from synalysis_crew.graph import analyze  # noqa: E402
@@ -235,142 +235,203 @@ def test_parser_chinese_errors_missing_file_and_column(tmp_path):
 
 
 # =====================================================================
-# 指标：2.3 全部 32 项映射 + 中途开始关键数值
+# 指标：v2 全部 32 项映射 + 中途开始关键数值
 # =====================================================================
 
 
+def _v2_checklist_trades() -> list[TradeRecord]:
+    """v2.1 32 项清单场景：完整历史 + 4 个完整交易闭环（A +5000 / B -9000 /
+    C +15000 / D -6000），累计入金 15000，期末资产 20000。
+
+    v2.1 TWR 逐日 v 序列：[1.0, 1.5, 1.5, 1.5, 0.825, 0.825, 1.95, 1.95, 1.5]
+    （2/1 转账 5000 日 r=0，出入金不产生收益）→ 月末 R = [0.5, -0.175, 0.95, 0.5]；
+    峰值 1.95 < 2.0 无翻倍、最低 0.825 > 0.75(=0.5×1.5) 无腰斩；
+    最大回撤 = (1.5 - 0.825) / 1.5 = 0.45；主口径 R = 0.5。
+    """
+    return [
+        TradeRecord(code="", name="", op_type=OpType.BANK_TO_SEC, qty=0.0, price=0.0,
+                    amount=0.0, balance=10000.0, trade_date=date(2024, 1, 2),
+                    currency="人民币"),
+        TradeRecord(code="A", name="A股", op_type=OpType.BUY, qty=100.0, price=50.0,
+                    amount=5000.0, balance=5000.0, trade_date=date(2024, 1, 3),
+                    currency="人民币"),
+        TradeRecord(code="A", name="A股", op_type=OpType.SELL, qty=100.0, price=100.0,
+                    amount=10000.0, balance=15000.0, trade_date=date(2024, 1, 5),
+                    currency="人民币"),
+        TradeRecord(code="", name="", op_type=OpType.BANK_TO_SEC, qty=0.0, price=0.0,
+                    amount=0.0, balance=20000.0, trade_date=date(2024, 2, 1),
+                    currency="人民币"),
+        TradeRecord(code="B", name="B股", op_type=OpType.BUY, qty=100.0, price=100.0,
+                    amount=10000.0, balance=10000.0, trade_date=date(2024, 2, 5),
+                    currency="人民币"),
+        TradeRecord(code="B", name="B股", op_type=OpType.SELL, qty=100.0, price=10.0,
+                    amount=1000.0, balance=11000.0, trade_date=date(2024, 2, 10),
+                    currency="人民币"),
+        TradeRecord(code="C", name="C股", op_type=OpType.BUY, qty=100.0, price=50.0,
+                    amount=5000.0, balance=6000.0, trade_date=date(2024, 3, 2),
+                    currency="人民币"),
+        TradeRecord(code="C", name="C股", op_type=OpType.SELL, qty=100.0, price=200.0,
+                    amount=20000.0, balance=26000.0, trade_date=date(2024, 3, 10),
+                    currency="人民币"),
+        TradeRecord(code="D", name="D股", op_type=OpType.BUY, qty=100.0, price=100.0,
+                    amount=10000.0, balance=16000.0, trade_date=date(2024, 4, 2),
+                    currency="人民币"),
+        TradeRecord(code="D", name="D股", op_type=OpType.SELL, qty=100.0, price=40.0,
+                    amount=4000.0, balance=20000.0, trade_date=date(2024, 4, 10),
+                    currency="人民币"),
+    ]
+
+
 def test_metrics_result_covers_all_32_requirement_items(no_price_fetch):
-    """需求 2.3 的 32 项指标逐一映射断言（A-D 在 MetricsResult，E 在 AnalysisResult）。"""
-    trades = make_trades()
+    """v2 规格（requirements-v2.md 1.1–1.6 + API 契约）的 32 项指标逐一映射断言。"""
+    trades = _v2_checklist_trades()
     metrics = compute_metrics(trades)
     result = analyze(trades, metrics, max_rounds=2)
     m = metrics
 
-    # 区间口径标注：文件从账户中途开始（首行卖出期初持仓）
-    assert m["meta"]["is_partial"] is True
+    assert m["meta"]["is_partial"] is False
     assert json.loads(json.dumps(m, ensure_ascii=False, allow_nan=False)) == m.to_dict()
 
     checks = [
         # ---- A. 账户总览（8 项）----
         ("1 统计区间（首末交易日）",
-         lambda: (isinstance(m["meta"]["start_date"], str) and
-                  isinstance(m["meta"]["end_date"], str) and
-                  m["meta"]["start_date"] <= m["meta"]["end_date"])),
+         lambda: (m["meta"]["start_date"] == "2024-01-02" and
+                  m["meta"]["end_date"] == "2024-04-10" and
+                  m["meta"]["calendar_days"] == 100 and
+                  m["meta"]["active_trading_days"] == 8)),
         ("2 期初资金 / 期末资金",
-         lambda: (isinstance(m["account"]["initial_balance"], float) and
-                  m["account"]["ending_balance"] == pytest.approx(173277.84))),
-        ("3 净转入资金（银行转证券 − 证券转银行）",
-         lambda: m["account"]["net_transfer_in"] == pytest.approx(30000.0)),
-        ("4 总收益率（按 H1 标注区间口径）",
-         lambda: isinstance(m["account"]["total_return_rate"], float)),
-        ("5 年化收益率（按区间天数折算）",
-         lambda: isinstance(m["account"]["annualized_return_rate"], float)),
-        ("6 累计已实现盈亏（FIFO 含费用）",
-         lambda: m["account"]["realized_pnl"] == pytest.approx(1305.94)),
+         lambda: (m["account"]["initial_balance"] == pytest.approx(0.0) and
+                  m["account"]["ending_balance"] == pytest.approx(20000.0))),
+        ("3 净转入资金 / 累计入金 / 累计出金",
+         lambda: (m["account"]["net_transfer_in"] == pytest.approx(15000.0) and
+                  m["account"]["gross_deposit"] == pytest.approx(15000.0) and
+                  m["account"]["gross_withdraw"] == pytest.approx(0.0))),
+        ("4 总收益率主口径（v2.1 TWR：R = Π(1+r_d) − 1 = 0.5）",
+         lambda: m["account"]["total_return_rate"] == pytest.approx(0.5, abs=1e-4)),
+        ("5 年化收益率（按区间自然日折算：1.5^(365/99) − 1 ≈ 3.4589）",
+         lambda: m["account"]["annualized_return_rate"] == pytest.approx(
+             3.4589, abs=1e-4)),
+        ("6 累计已实现盈亏（完整交易闭环）",
+         lambda: m["account"]["realized_pnl"] == pytest.approx(5000.0)),
         ("7 总交易成本及占成交额比例",
-         lambda: (m["account"]["total_cost"] == pytest.approx(205.66) and
-                  m["account"]["total_cost_ratio"] == pytest.approx(0.0012, abs=1e-4))),
-        ("8 期末持仓市值 / 浮动盈亏（H3 按成本兜底）",
-         lambda: (m["account"]["holding_market_value"] == pytest.approx(8270.0) and
+         lambda: (m["account"]["total_cost"] == pytest.approx(0.0) and
+                  m["account"]["total_cost_ratio"] == pytest.approx(0.0))),
+        ("8 期末持仓市值 / 浮动盈亏（按成本兜底）",
+         lambda: (m["account"]["holding_market_value"] == pytest.approx(0.0) and
                   m["account"]["unrealized_pnl"] == pytest.approx(0.0) and
                   m["account"]["market_value_source"] == "cost")),
         # ---- B. 交易统计（7 项）----
         ("9 总成交金额、总笔数",
-         lambda: (m["trading"]["total_amount"] == pytest.approx(174860.0) and
-                  m["trading"]["total_count"] == 4)),
+         lambda: (m["trading"]["total_amount"] == pytest.approx(65000.0) and
+                  m["trading"]["total_count"] == 8)),
         ("10 买入笔数/金额、卖出笔数/金额",
-         lambda: (m["trading"]["buy_count"] == 2 and
-                  m["trading"]["buy_amount"] == pytest.approx(15900.0) and
-                  m["trading"]["sell_count"] == 2 and
-                  m["trading"]["sell_amount"] == pytest.approx(158960.0))),
+         lambda: (m["trading"]["buy_count"] == 4 and
+                  m["trading"]["buy_amount"] == pytest.approx(30000.0) and
+                  m["trading"]["sell_count"] == 4 and
+                  m["trading"]["sell_amount"] == pytest.approx(35000.0))),
         ("11 日均交易笔数、日均成交额",
          lambda: (m["trading"]["daily_avg_count"] == pytest.approx(1.0) and
-                  m["trading"]["daily_avg_amount"] == pytest.approx(43715.0))),
+                  m["trading"]["daily_avg_amount"] == pytest.approx(8125.0))),
         ("12 交易股票数（去重）、当前持仓只数",
-         lambda: (m["trading"]["distinct_stock_count"] == 2 and
-                  m["trading"]["current_holding_count"] == 1)),
+         lambda: (m["trading"]["distinct_stock_count"] == 4 and
+                  m["trading"]["current_holding_count"] == 0)),
         ("13 平均单笔金额",
-         lambda: m["trading"]["avg_trade_amount"] == pytest.approx(43715.0)),
+         lambda: m["trading"]["avg_trade_amount"] == pytest.approx(8125.0)),
         ("14 资金周转率",
-         lambda: m["trading"]["capital_turnover_rate"] == pytest.approx(0.95, abs=0.01)),
-        ("15 平均持仓周期（FIFO 配对，天数）",
-         lambda: m["trading"]["avg_holding_period_days"] == pytest.approx(40.0)),
-        # ---- C. 盈亏分析（9 项）----
-        ("16 已实现盈亏总额（含费用）",
-         lambda: m["pnl"]["realized_pnl"] == pytest.approx(1305.94)),
-        ("17 盈利笔数 / 亏损笔数 / 胜率",
-         lambda: (m["pnl"]["win_count"] == 1 and m["pnl"]["loss_count"] == 0 and
-                  m["pnl"]["win_rate"] == pytest.approx(1.0))),
+         lambda: m["trading"]["capital_turnover_rate"] == pytest.approx(
+             4.68, abs=0.01)),
+        ("15 平均持仓周期（完整交易：3+6+9+9 → 6.75 天）",
+         lambda: m["trading"]["avg_holding_period_days"] == pytest.approx(6.75)),
+        # ---- C. 盈亏分析（11 项）----
+        ("16 已实现盈亏总额（完整交易口径）",
+         lambda: m["pnl"]["realized_pnl"] == pytest.approx(5000.0)),
+        ("17 盈利/亏损完整交易数、胜率",
+         lambda: (m["pnl"]["win_count"] == 2 and m["pnl"]["loss_count"] == 2 and
+                  m["pnl"]["win_rate"] == pytest.approx(0.5))),
         ("18 总盈利金额 / 总亏损金额 / 盈亏比",
-         lambda: (m["pnl"]["total_profit"] == pytest.approx(1305.94) and
-                  m["pnl"]["total_loss"] == pytest.approx(0.0) and
-                  m["pnl"]["profit_loss_ratio"] is None)),
+         lambda: (m["pnl"]["total_profit"] == pytest.approx(20000.0) and
+                  m["pnl"]["total_loss"] == pytest.approx(15000.0) and
+                  m["pnl"]["profit_loss_ratio"] == pytest.approx(4 / 3, abs=1e-4))),
         ("19 最大单笔盈利 / 最大单笔亏损",
-         lambda: (m["pnl"]["max_single_profit"] == pytest.approx(1305.94) and
-                  m["pnl"]["max_single_loss"] == pytest.approx(0.0))),
-        ("20 翻倍次数（完整持仓周期收益率 ≥ +100%）",
+         lambda: (m["pnl"]["max_single_profit"] == pytest.approx(15000.0) and
+                  m["pnl"]["max_single_loss"] == pytest.approx(-9000.0))),
+        ("20 账户翻倍次数（v2.1：R ≥ +100% 独立事件，峰值 1.95 < 2 → 0）",
          lambda: m["pnl"]["double_count"] == 0),
-        ("21 腰斩次数（完整持仓周期收益率 ≤ −50%）",
+        ("21 账户腰斩次数（v2.1：v ≤ 0.5×v_peak 独立事件，最低 0.825 > 0.75 → 0）",
          lambda: m["pnl"]["halved_count"] == 0),
         ("22 月度盈亏序列",
          lambda: m["pnl"]["monthly_pnl"] == [
-             {"month": "2025-11", "pnl": 0.0},
-             {"month": "2025-12", "pnl": 0.0},
-             {"month": "2026-01", "pnl": 1305.94},
+             {"month": "2024-01", "pnl": 5000.0},
+             {"month": "2024-02", "pnl": -9000.0},
+             {"month": "2024-03", "pnl": 15000.0},
+             {"month": "2024-04", "pnl": -6000.0},
          ]),
-        ("23 累计收益曲线 + 最大回撤",
-         lambda: (len(m["pnl"]["equity_curve"]) == 3 and
-                  m["pnl"]["max_drawdown"] == pytest.approx(0.0914, abs=1e-4))),
-        ("24 个股盈亏榜 Top10（盈利/亏损）",
-         lambda: (m["pnl"]["stock_leaderboard"]["top_profit"][0]["code"] == "000001" and
-                  m["pnl"]["stock_leaderboard"]["top_loss"] == [])),
-        # ---- D. 行为画像（6 项）----
-        ("D1 持仓周期分布（≤1 / 2–5 / 6–20 / >20 天）",
+        ("23 收益率曲线 return_curve（v2.1 TWR 月末累计 R）",
+         lambda: m["pnl"]["return_curve"] == [
+             {"month": "2024-01", "date": "2024-01-05", "return_rate": 0.5},
+             {"month": "2024-02", "date": "2024-02-10", "return_rate": -0.175},
+             {"month": "2024-03", "date": "2024-03-10", "return_rate": 0.95},
+             {"month": "2024-04", "date": "2024-04-10", "return_rate": 0.5},
+         ]),
+        ("24 最大回撤（基于逐日 1+R 序列）",
+         lambda: m["pnl"]["max_drawdown"] == pytest.approx(0.45, abs=1e-4)),
+        ("25 完整交易 trades（闭环字段齐备、status=closed）",
+         lambda: (len(m["trades"]) == 4 and
+                  m["trades"][0] == {
+                      "code": "A", "name": "A股", "buy_qty": 100.0,
+                      "buy_amount": 5000.0, "sell_qty": 100.0,
+                      "sell_amount": 10000.0, "pnl": 5000.0,
+                      "holding_days": 3, "start_date": "2024-01-03",
+                      "end_date": "2024-01-05", "status": "closed",
+                  } and
+                  all(t["status"] == "closed" for t in m["trades"]))),
+        ("26 unmatched_sell_amount（期初持仓卖出单列）",
+         lambda: m["pnl"]["unmatched_sell_amount"] == pytest.approx(0.0)),
+        ("27 个股盈亏榜（top_loss 升序、top_profit 降序）",
+         lambda: ([x["code"] for x in m["pnl"]["stock_leaderboard"]["top_loss"]] ==
+                  ["B", "D"] and
+                  [x["code"] for x in m["pnl"]["stock_leaderboard"]["top_profit"]] ==
+                  ["C", "A"])),
+        # ---- D. 行为画像（4 项）----
+        ("28 持仓周期分布（按完整交易）",
          lambda: m["behavior"]["holding_period_distribution"] == {
-             "le_1d": 0, "2_5d": 0, "6_20d": 0, "gt_20d": 1,
+             "le_1d": 0, "2_5d": 1, "6_20d": 3, "gt_20d": 0,
          }),
-        ("D2 月度交易活跃度",
+        ("29 月度交易活跃度",
          lambda: m["behavior"]["monthly_activity"] == [
-             {"month": "2025-11", "total_count": 2, "buy_count": 1, "sell_count": 1},
-             {"month": "2025-12", "total_count": 1, "buy_count": 1, "sell_count": 0},
-             {"month": "2026-01", "total_count": 1, "buy_count": 0, "sell_count": 1},
+             {"month": "2024-01", "total_count": 2, "buy_count": 1, "sell_count": 1},
+             {"month": "2024-02", "total_count": 2, "buy_count": 1, "sell_count": 1},
+             {"month": "2024-03", "total_count": 2, "buy_count": 1, "sell_count": 1},
+             {"month": "2024-04", "total_count": 2, "buy_count": 1, "sell_count": 1},
          ]),
-        ("D3 单票最大仓位（占资金比例）",
-         lambda: (m["behavior"]["max_position"]["ratio"] == pytest.approx(0.0796, abs=1e-4) and
-                  m["behavior"]["max_position"]["code"] == "000001")),
-        ("D4 交易集中度（Top5 成交额占比）",
-         lambda: m["behavior"]["top5_concentration"] == pytest.approx(1.0)),
-        ("D5 偏好个股 Top10（按交易次数）",
-         lambda: m["behavior"]["favorite_stocks_top10"][0] == {
-             "code": "000001", "name": "平安银行", "count": 3, "amount": 24860.0,
-         }),
-        ("D6 风格初判（短线/波段/长线 × 集中/分散 × 激进/稳健）+ 特殊操作统计",
-         lambda: (m["behavior"]["style"]["label"] == "长线·集中·稳健" and
-                  m["behavior"]["special_operations"]["reverse_repo"]["count"] == 2 and
-                  m["behavior"]["special_operations"]["dividend"]["count"] == 2 and
-                  m["behavior"]["special_operations"]["bonus_share"]["qty"] == pytest.approx(150.0) and
-                  m["behavior"]["special_operations"]["interest"]["count"] == 1 and
-                  m["behavior"]["special_operations"]["ipo"]["count"] == 0 and
-                  m["behavior"]["special_operations"]["other"]["count"] == 1)),
-        # ---- E. AI 分析（2 项）----
-        ("E1 5 位分析师个人点评 + 个人标签",
+        ("30 单票最大仓位 + Top5 集中度",
+         lambda: (m["behavior"]["max_position"]["ratio"] == pytest.approx(0.5, abs=1e-4) and
+                  m["behavior"]["max_position"]["code"] == "A" and
+                  m["behavior"]["top5_concentration"] == pytest.approx(1.0))),
+        ("31 偏好个股 Top10 + 风格初判 + 特殊操作统计",
+         lambda: (m["behavior"]["favorite_stocks_top10"][0]["code"] == "C" and
+                  m["behavior"]["style"]["label"] == "短线·集中·激进" and
+                  m["behavior"]["special_operations"]["reverse_repo"]["count"] == 0 and
+                  m["behavior"]["special_operations"]["dividend"]["count"] == 0)),
+        # ---- E. AI 分析（1 项）----
+        ("32 AI 分析（5 位分析师 + 综合报告 + 免责声明）",
          lambda: (len(result["analysts"]) == 5 and
                   all(a["analysis"] and a["suggestion"] and 2 <= len(a["tags"]) <= 4
-                      for a in result["analysts"]))),
-        ("E2 综合分析报告 + 总标签 + 风险提示 + 免责声明",
-         lambda: ("# 交易分析报告" in result["final_report"] and
+                      for a in result["analysts"]) and
+                  "# 交易分析报告" in result["final_report"] and
                   "风险提示" in result["final_report"] and
                   result["overall_tags"] and
                   result["disclaimer"] == DISCLAIMER and
                   result["final_report"].rstrip().endswith(f"> {DISCLAIMER}"))),
     ]
-    assert len(checks) == 32, "2.3 指标清单必须恰好 32 项"
+    assert len(checks) == 32, "v2 指标清单必须恰好 32 项"
     for label, check in checks:
         assert check(), f"指标项未通过：{label}"
 
 
 def test_metrics_midstream_key_numbers(no_price_fetch):
-    """中途开始场景关键数值手算抽查（FIFO 含费用、胜率、盈亏比、最大回撤等）。"""
+    """中途开始场景（合成交割单）关键数值手算抽查：FIFO 含费、未清仓不计胜率、
+    v2.1 TWR 收益率曲线、期初持仓合成、账户级翻倍/腰斩、最大回撤。"""
     m = compute_metrics(make_trades())
     assert isinstance(m, MetricsResult)
     assert m["meta"]["is_partial"] is True
@@ -379,38 +440,171 @@ def test_metrics_midstream_key_numbers(no_price_fetch):
     assert m["meta"]["calendar_days"] == 48
     assert m["meta"]["active_trading_days"] == 4
 
-    # FIFO 含费用：800 股卖出配对成本 7640（含买入费用），净额 8945.94 → +1305.94
+    # FIFO 含费用 + 红股摊薄：800 股卖出配对成本 7640，净额 8945.94 → +1305.94
     assert m["account"]["realized_pnl"] == pytest.approx(1305.94, abs=0.01)
     assert m["account"]["total_cost"] == pytest.approx(205.66, abs=0.01)
     assert m["pnl"]["realized_pnl"] == pytest.approx(1305.94, abs=0.01)
-    assert m["pnl"]["win_count"] == 1
+    # 000001 买 1500 + 红股 150 → 1650，仅卖 800：未清仓 → 不计完整交易/胜率
+    assert m["trades"] == []
+    assert m["pnl"]["win_count"] == 0
     assert m["pnl"]["loss_count"] == 0
-    assert m["pnl"]["win_rate"] == pytest.approx(1.0)
-    assert m["pnl"]["profit_loss_ratio"] is None  # 无亏损 → 盈亏比 None
+    assert m["pnl"]["win_rate"] is None
+    assert m["pnl"]["profit_loss_ratio"] is None
+    assert m["pnl"]["max_single_profit"] == 0.0
+    assert m["pnl"]["max_single_loss"] == 0.0
+    assert m["trading"]["avg_holding_period_days"] is None
+    assert m["behavior"]["holding_period_distribution"] == {
+        "le_1d": 0, "2_5d": 0, "6_20d": 0, "gt_20d": 0,
+    }
     assert m["pnl"]["double_count"] == 0
     assert m["pnl"]["halved_count"] == 0
     assert m["pnl"]["unmatched_sell_amount"] == pytest.approx(149818.50, abs=0.01)
 
-    # 区间收益率（期初资产基准）：期初资产 = 期初现金 0 + 期初持仓变现估值 149818.50；
-    # 净转入 30000；期末资产 181547.84 → (181547.84 - 149818.50 - 30000) / 149818.50
+    # v2.1 主口径 = 逐日 TWR 最终 R（精确链 1.0149017553 − 1 → 4 位舍入 0.0149）
     trr = m["account"]["total_return_rate"]
-    assert trr == pytest.approx(
+    assert trr == pytest.approx(0.0149, abs=1e-4)
+    # 对照口径（期初资产基准简单收益率）：
+    # (181547.84 − 149818.50 − 30000) / 149818.50 ≈ 0.0115
+    assert m["account"]["total_return_rate_net"] == pytest.approx(
         (181547.84 - 149818.50 - 30000) / 149818.50, abs=1e-4
     )
     assert m["account"]["opening_asset_value"] == pytest.approx(149818.50, abs=0.01)
     assert m["account"]["gross_deposit"] == pytest.approx(50000.0, abs=0.01)
     assert m["account"]["gross_withdraw"] == pytest.approx(20000.0, abs=0.01)
     span_days = 47
-    # 年化按未舍入收益率折算后再四舍五入，与模块口径一致（容差覆盖舍入差异）
-    assert m["account"]["annualized_return_rate"] == pytest.approx(
-        (1 + trr) ** (365 / span_days) - 1, abs=10.0
+    # M11：年化按模块舍入逻辑精确断言（未舍入 R ≈ 0.0149017553，span = 47）
+    assert m["account"]["annualized_return_rate"] == pytest.approx(0.1217, abs=1e-4)
+    # 收益率曲线（v2.1 TWR 月末累计 R）：
+    # 2025-11 = −5/149818.50 ≈ −0.0000334（买入费）→ 0.0；
+    # 2025-12 = 295/199813.50 ≈ 0.0014；2026-01 = 0.0149
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2025-11", "date": "2025-11-28", "return_rate": 0.0},
+        {"month": "2025-12", "date": "2025-12-02", "return_rate": 0.0014},
+        {"month": "2026-01", "date": "2026-01-13", "return_rate": 0.0149},
+    ]
+    # 最大回撤基于逐日 (1+R)：逆回购本金价值中性（应收款 1:1），
+    # 最大回撤来自 1/6 红利税 −100 元：(1.0120525 − 1.0115520)/1.0120525 ≈ 0.0005
+    assert m["pnl"]["max_drawdown"] == pytest.approx(0.0005, abs=1e-4)
+    # 月度盈亏：1 月卖出 800 股 +1305.94
+    assert m["pnl"]["monthly_pnl"] == [
+        {"month": "2025-11", "pnl": 0.0},
+        {"month": "2025-12", "pnl": 0.0},
+        {"month": "2026-01", "pnl": 1305.94},
+    ]
+    # 无完整交易 → 平均持仓 None；风格：波段·集中·稳健
+    assert m["behavior"]["monthly_activity"] == [
+        {"month": "2025-11", "total_count": 2, "buy_count": 1, "sell_count": 1},
+        {"month": "2025-12", "total_count": 1, "buy_count": 1, "sell_count": 0},
+        {"month": "2026-01", "total_count": 1, "buy_count": 0, "sell_count": 1},
+    ]
+    assert m["behavior"]["style"]["label"] == "波段·集中·稳健"
+
+
+def test_metrics_midstream_completed_trade_and_special_ops(no_price_fetch):
+    """中途开始 + 完整交易闭环 + 特殊操作剔除 + A0>0 收益率曲线（v2 1.1/1.3）。"""
+    trades = [
+        TradeRecord(code="OLD", name="老股", op_type=OpType.SELL, qty=200.0,
+                    price=20.0, amount=4000.0, balance=4000.0,
+                    trade_date=date(2025, 11, 27), currency="人民币"),
+        TradeRecord(code="", name="", op_type=OpType.BANK_TO_SEC, qty=0.0,
+                    price=0.0, amount=0.0, balance=14000.0,
+                    trade_date=date(2025, 12, 3), currency="人民币"),
+        TradeRecord(code="", name="", op_type=OpType.DIVIDEND, qty=0.0,
+                    price=0.0, amount=50.0, balance=14050.0,
+                    trade_date=date(2025, 12, 5), currency="人民币"),
+        TradeRecord(code="N", name="N股", op_type=OpType.BUY, qty=100.0,
+                    price=50.0, amount=5000.0, balance=9050.0,
+                    trade_date=date(2026, 1, 6), currency="人民币"),
+        TradeRecord(code="131810", name="R-001", op_type=OpType.REPO, qty=10.0,
+                    price=100.0, amount=1000.0, balance=8049.9,
+                    trade_date=date(2026, 1, 8), fee=0.1, commission=0.1,
+                    currency="人民币"),
+        TradeRecord(code="N", name="N股", op_type=OpType.SELL, qty=100.0,
+                    price=120.0, amount=12000.0, balance=20049.9,
+                    trade_date=date(2026, 1, 9), currency="人民币"),
+        TradeRecord(code="", name="", op_type=OpType.INTEREST, qty=0.0,
+                    price=0.0, amount=0.0, balance=20051.1,
+                    trade_date=date(2026, 1, 10), currency="人民币"),
+        TradeRecord(code="", name="", op_type=OpType.DESIGNATED_TRADE, qty=0.0,
+                    price=0.0, amount=0.0, balance=20051.1,
+                    trade_date=date(2026, 1, 12), currency="人民币"),
+    ]
+    m = compute_metrics(trades)
+    assert m["meta"]["is_partial"] is True
+    # 期初持仓卖出只记 unmatched_sell_amount，不进 trades
+    assert m["pnl"]["unmatched_sell_amount"] == pytest.approx(4000.0, abs=0.01)
+    # 完整交易只有 N 的闭环（分红/逆回购/利息/指定交易/转账一律剔除）
+    assert m["trades"] == [
+        {
+            "code": "N", "name": "N股", "buy_qty": 100.0, "buy_amount": 5000.0,
+            "sell_qty": 100.0, "sell_amount": 12000.0, "pnl": 7000.0,
+            "holding_days": 4, "start_date": "2026-01-06",
+            "end_date": "2026-01-09", "status": "closed",
+        }
+    ]
+    assert m["pnl"]["win_count"] == 1
+    assert m["pnl"]["win_rate"] == pytest.approx(1.0)
+    assert m["pnl"]["realized_pnl"] == pytest.approx(7000.0, abs=0.01)
+    sp = m["behavior"]["special_operations"]
+    assert sp["dividend"] == {"count": 1, "amount": pytest.approx(50.0)}
+    assert sp["reverse_repo"]["count"] == 1
+    assert sp["interest"]["count"] == 1
+    assert sp["other"]["count"] == 1
+    # A0 = 4000（期初持仓合成）：首日卖出期初持仓 r = 0，入金日 r = 0
+    assert m["account"]["opening_asset_value"] == pytest.approx(4000.0, abs=0.01)
+    # v2.1 TWR 月末累计 R：2025-11 = 0（合成持仓 1:1）；
+    # 2025-12 = 50/14000 ≈ 0.0036（红利计为盈亏）；2026-01 = 0.5036
+    #（逆回购本金 1000 以应收款留存在资产中，R = 21051.1/14000 − 1）
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2025-11", "date": "2025-11-27", "return_rate": 0.0},
+        {"month": "2025-12", "date": "2025-12-05", "return_rate": 0.0036},
+        {"month": "2026-01", "date": "2026-01-12", "return_rate": 0.5036},
+    ]
+    # v 峰值 ≈ 1.5036 < 2.0：无翻倍/腰斩；逆回购本金价值中性 → 无显著回撤
+    assert m["pnl"]["double_count"] == 0
+    assert m["pnl"]["halved_count"] == 0
+    assert m["pnl"]["max_drawdown"] == 0.0
+    assert m["account"]["total_return_rate"] == pytest.approx(0.5036, abs=1e-4)
+
+
+def _tr(code, name, op, qty, price, amount, balance, d) -> TradeRecord:
+    return TradeRecord(
+        code=code, name=name, op_type=op, qty=qty, price=price, amount=amount,
+        balance=balance, trade_date=d, currency="人民币",
     )
-    # 最大回撤 = (199818.50 − 181547.84) / 199818.50
-    assert m["pnl"]["max_drawdown"] == pytest.approx(18270.66 / 199818.50, abs=1e-4)
-    # 持仓周期：40 天 → >20 天桶；风格：长线·集中·稳健
-    assert m["behavior"]["holding_period_distribution"]["gt_20d"] == 1
-    assert m["trading"]["avg_holding_period_days"] == pytest.approx(40.0)
-    assert m["behavior"]["style"]["label"] == "长线·集中·稳健"
+
+
+def test_twr_double_halved_events_hand_check(no_price_fetch):
+    """v2.1 1.4 翻倍/腰斩（真实 TradeRecord 集成手算）。
+
+    逐日 v：1.0 → 2.0（翻倍#1）→ 1.75 → 2.55（翻倍#2）→ 1.05（腰斩#1）
+    → 1.3 → 1.5 → 1.1（腰斩#2）；最终 R = 0.1；回撤 = (2.55−1.05)/2.55。
+    """
+    trades = [
+        _tr("", "", OpType.BANK_TO_SEC, 0, 0, 0, 10000, date(2024, 1, 2)),
+        _tr("A", "A股", OpType.BUY, 100, 10, 1000, 9000, date(2024, 1, 3)),
+        _tr("A", "A股", OpType.SELL, 100, 110, 11000, 20000, date(2024, 1, 4)),
+        _tr("B", "B股", OpType.BUY, 100, 50, 5000, 15000, date(2024, 1, 5)),
+        _tr("B", "B股", OpType.SELL, 100, 25, 2500, 17500, date(2024, 1, 6)),
+        _tr("C", "C股", OpType.BUY, 100, 80, 8000, 9500, date(2024, 1, 7)),
+        _tr("C", "C股", OpType.SELL, 100, 160, 16000, 25500, date(2024, 1, 8)),
+        _tr("D", "D股", OpType.BUY, 100, 200, 20000, 5500, date(2024, 1, 9)),
+        _tr("D", "D股", OpType.SELL, 100, 50, 5000, 10500, date(2024, 1, 10)),
+        _tr("E", "E股", OpType.BUY, 100, 30, 3000, 7500, date(2024, 1, 11)),
+        _tr("E", "E股", OpType.SELL, 100, 55, 5500, 13000, date(2024, 1, 12)),
+        _tr("G", "G股", OpType.BUY, 100, 60, 6000, 7000, date(2024, 1, 15)),
+        _tr("G", "G股", OpType.SELL, 100, 80, 8000, 15000, date(2024, 1, 16)),
+        _tr("H", "H股", OpType.BUY, 100, 80, 8000, 7000, date(2024, 1, 17)),
+        _tr("H", "H股", OpType.SELL, 100, 40, 4000, 11000, date(2024, 1, 18)),
+    ]
+    m = compute_metrics(trades)
+    assert m["account"]["total_return_rate"] == pytest.approx(0.1, abs=1e-4)
+    assert m["pnl"]["double_count"] == 2
+    assert m["pnl"]["halved_count"] == 2
+    assert m["pnl"]["max_drawdown"] == pytest.approx((2.55 - 1.05) / 2.55, abs=1e-4)
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-18", "return_rate": 0.1},
+    ]
 
 
 # =====================================================================
