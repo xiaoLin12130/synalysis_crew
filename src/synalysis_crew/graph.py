@@ -32,10 +32,23 @@ from synalysis_crew.state import AnalysisResult, AnalysisState
 _MAX_WORKERS = 5  # 5 位分析师并行
 _DEFAULT_MAX_ROUNDS = 2
 
+# 进度回调钩子：analyze() 设置，各节点上报阶段/百分比/消息（供后端轮询与前端进度条）
+_PROGRESS_HOOK = None
+
+
+def _emit(stage: str, pct: int, message: str) -> None:
+    hook = _PROGRESS_HOOK
+    if hook is not None:
+        try:
+            hook(stage, int(pct), message)
+        except Exception:
+            pass
+
 
 # ───────────────────────── profile 节点 ─────────────────────────
 
 def profile_node(state: AnalysisState) -> dict:
+    _emit("profile", 12, "生成脱敏交易画像")
     return {"profile": build_profile(state.get("trades", []), state.get("metrics", {}))}
 
 
@@ -64,12 +77,16 @@ def analysts_node(state: AnalysisState) -> dict:
     metrics = state.get("metrics", {})
     entries: list[dict] = []
     degraded = False
+    total = len(skills)
+    done = 0
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
         futures = {pool.submit(_run_analyst, s, profile, metrics): i for i, s in enumerate(skills)}
         for future in as_completed(futures):
             entry, fell_back = future.result()
             entries.append((futures[future], entry))
             degraded = degraded or fell_back
+            done += 1
+            _emit("analysts", 20 + int(done / max(total, 1) * 30), f"分析师点评 {done}/{total}")
     entries.sort(key=lambda item: item[0])
     return {"analysts": [entry for _, entry in entries], "degraded": degraded}
 
@@ -77,6 +94,7 @@ def analysts_node(state: AnalysisState) -> dict:
 # ───────────────────────── host 节点（找实质性分歧） ─────────────────────────
 
 def host_node(state: AnalysisState) -> dict:
+    _emit("host", 55, "主持人判断分歧")
     analysts = state.get("analysts", [])
     round_label = "首轮" if not state.get("debate_history") else f"第{state.get('round_count', 0) + 1}轮"
     if llm_available():
@@ -98,6 +116,7 @@ def host_node(state: AnalysisState) -> dict:
 def debate_node(state: AnalysisState) -> dict:
     topic = state.get("discussion_topic", "")
     round_no = state.get("round_count", 0) + 1
+    _emit("debate", 60, f"第 {round_no} 轮辩论")
     if not topic:
         return {
             "round_count": round_no,
@@ -174,6 +193,7 @@ def _merge_tags(state: AnalysisState, fallback: list[str] | None = None) -> list
 
 
 def report_node(state: AnalysisState) -> dict:
+    _emit("report", 90, "生成最终报告")
     profile = state.get("profile", "")
     metrics = state.get("metrics", {})
     analysts = state.get("analysts", [])
@@ -297,13 +317,21 @@ def _fallback_result(state: AnalysisState) -> AnalysisResult:
     }
 
 
-def analyze(trades, metrics, max_rounds: int = _DEFAULT_MAX_ROUNDS) -> AnalysisResult:
+def analyze(
+    trades,
+    metrics,
+    max_rounds: int = _DEFAULT_MAX_ROUNDS,
+    progress=None,
+) -> AnalysisResult:
     """AI 分析入口：profile → analysts → host → debate → report，绝不抛异常。
 
     trades: 交易记录列表（dict 或带 to_dict() 的对象，仅读取脱敏字段）
     metrics: MetricsResult（dict 或带 to_dict() 的对象）
     max_rounds: 辩论轮次上限，默认 2
+    progress: 可选回调 progress(stage, pct, message)，stage ∈ profile/analysts/host/debate/report/done
     """
+    global _PROGRESS_HOOK
+    _PROGRESS_HOOK = progress
     try:
         metrics_dict = _as_dict(metrics)
         try:
@@ -325,6 +353,7 @@ def analyze(trades, metrics, max_rounds: int = _DEFAULT_MAX_ROUNDS) -> AnalysisR
             "degraded": False,
         }
         result = _get_app().invoke(initial)
+        _emit("done", 100, "分析完成")
         return _to_result(result)
     except Exception:
         # 任何意外都不允许抛给前端：整体降级为规则引擎结果
@@ -333,8 +362,12 @@ def analyze(trades, metrics, max_rounds: int = _DEFAULT_MAX_ROUNDS) -> AnalysisR
             safe_rounds = max(0, int(max_rounds if max_rounds is not None else _DEFAULT_MAX_ROUNDS))
         except (TypeError, ValueError):
             safe_rounds = _DEFAULT_MAX_ROUNDS
-        return _fallback_result({
+        result = _fallback_result({
             "trades": trades or [],
             "metrics": safe_metrics,
             "max_rounds": safe_rounds,
         })
+        _emit("done", 100, "降级完成（规则引擎）")
+        return result
+    finally:
+        _PROGRESS_HOOK = None

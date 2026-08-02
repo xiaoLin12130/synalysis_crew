@@ -1,0 +1,13 @@
+:root {
+  --accent: #10a37f;
+  --bg: #f7f7f5;
+  --card: #ffffff;
+  --border: #e7e8eb;
+  --sidebar: #17181d;
+  --sidebar-border: #26282f;
+  --text: #17181d;
+  --text-2: #7a7f87;
+}
+* { box-sizing: border-box; }
+body { margin: 0; font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif; background: var(--bg); color: var(--text); }
+.placeholder { padding: 40px; text-align: center; color: var(--text-2); }

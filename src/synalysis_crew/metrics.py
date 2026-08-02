@@ -33,6 +33,8 @@
               profit_loss_ratio, max_single_profit, max_single_loss, double_count, halved_count,
               unmatched_sell_amount, monthly_pnl[], equity_curve[], max_drawdown,
               stock_leaderboard{top_profit[], top_loss[]}},
+      "trades": [完整交易：买入→清仓闭环，{code, name, buy_qty, buy_amount, sell_qty,
+                sell_amount, pnl, holding_days, start_date, end_date, status}],
       "behavior": {holding_period_distribution{}, monthly_activity[], max_position{},
                    top5_concentration, favorite_stocks_top10[], style{}, special_operations{}}
     }
@@ -45,6 +47,10 @@
 - 完整历史（期初资产 = 0）时退化为「累计入金基准」：
   收益率 = (期末资产 − 累计入金) / 累计入金（用户视角：总共投入多少、现在剩多少）。
 - ``total_return_rate_net`` 为辅口径（纯现金期初基准，忽略期初持仓，仅供对照）。
+- ``win_rate/盈亏比/持仓周期`` 均按**完整交易**（个股首次买入→清仓闭环）统计，
+  每闭环计一笔：周期盈亏 = 卖出净额 − 买入成本（含费用）；
+- ``double_count/halved_count`` 为**账户级**：按月末近似净值曲线统计
+  「从低点翻倍」与「从高点腰斩（回撤≥50%）」的独立事件次数；
 - 金额四舍五入到 2 位、比率到 4 位；非有限数输出 None，保证严格 JSON 序列化；
 - 无配对持仓的卖出（期初持仓）记入 ``unmatched_sell_amount``，不计入已实现盈亏与胜率。
 """
@@ -635,6 +641,14 @@ def compute_metrics(
     code_turnover: Dict[str, float] = defaultdict(float)
     code_count: Dict[str, int] = defaultdict(int)
     code_realized: Dict[str, float] = defaultdict(float)
+    code_buy_count: Dict[str, int] = defaultdict(int)
+    code_sell_count: Dict[str, int] = defaultdict(int)
+    code_buy_qty: Dict[str, float] = defaultdict(float)
+    code_sell_qty: Dict[str, float] = defaultdict(float)
+    code_buy_amount: Dict[str, float] = defaultdict(float)
+    code_sell_amount: Dict[str, float] = defaultdict(float)
+    code_first_date: Dict[str, date] = {}
+    code_last_date: Dict[str, date] = {}
 
     realized_total = 0.0
     win_count = 0
@@ -648,8 +662,15 @@ def compute_metrics(
     unmatched_sell_amount = 0.0
 
     dist = {"le_1d": 0, "2_5d": 0, "6_20d": 0, "gt_20d": 0}
-    hold_days_wsum = 0.0
-    hold_qty_sum = 0.0
+    completed_trades: List[Dict[str, Any]] = []
+    cycle_win_count = 0
+    cycle_loss_count = 0
+    cycle_total_profit = 0.0
+    cycle_total_loss = 0.0
+    cycle_max_profit: Optional[float] = None
+    cycle_max_loss: Optional[float] = None
+    cycle_hold_days_sum = 0.0
+    cycle_hold_count = 0
 
     max_pos_ratio = 0.0
     max_pos_code: Optional[str] = None
@@ -730,6 +751,10 @@ def compute_metrics(
             equity_dates.add(rec.date)
             counts["total"] += 1
             code_count[code] += 1
+            code_first_date[code] = min(
+                code_first_date.get(code, rec.date), rec.date
+            )
+            code_last_date[code] = max(code_last_date.get(code, rec.date), rec.date)
             notional = rec.amount if rec.amount > _EPS else rec.gross
             turnover["total"] += notional
             code_turnover[code] += notional
@@ -738,6 +763,9 @@ def compute_metrics(
                 counts["buy"] += 1
                 turnover["buy"] += notional
                 activity[month]["buy"] += 1
+                code_buy_count[code] += 1
+                code_buy_qty[code] += rec.qty
+                code_buy_amount[code] += notional
                 cost = -cash_delta if cash_delta < -_EPS else rec.gross + rec.cost_fields
                 state.lots.append(_Lot(rec.qty, cost / rec.qty, rec.date))
                 if state.cycle is None:
@@ -750,6 +778,9 @@ def compute_metrics(
                 counts["sell"] += 1
                 turnover["sell"] += notional
                 activity[month]["sell"] += 1
+                code_sell_count[code] += 1
+                code_sell_qty[code] += rec.qty
+                code_sell_amount[code] += notional
                 proceeds = cash_delta if cash_delta > _EPS else rec.gross - rec.cost_fields
                 remaining = rec.qty
                 pnl = 0.0
@@ -780,36 +811,55 @@ def compute_metrics(
                     realized_total += pnl
                     realized_by_month[month] += pnl
                     code_realized[code] += pnl
-                    if pnl > _EPS:
-                        win_count += 1
-                        total_profit += pnl
-                        max_profit = pnl if max_profit is None else max(max_profit, pnl)
-                    elif pnl < -_EPS:
-                        loss_count += 1
-                        total_loss += -pnl
-                        max_loss = pnl if max_loss is None else min(max_loss, pnl)
-                    avg_days = days_wsum / matched_qty
-                    hold_days_wsum += days_wsum
-                    hold_qty_sum += matched_qty
-                    if avg_days <= 1.0:
-                        dist["le_1d"] += 1
-                    elif avg_days <= 5.0:
-                        dist["2_5d"] += 1
-                    elif avg_days <= 20.0:
-                        dist["6_20d"] += 1
-                    else:
-                        dist["gt_20d"] += 1
                 if (
                     state.cycle is not None
                     and state.cycle.sold_qty >= state.cycle.bought_qty - _EPS
                 ):
                     state.cycle.end_date = rec.date
                     cycle_return = state.cycle.return_rate()
-                    if cycle_return is not None:
-                        if cycle_return >= 1.0:
-                            double_count += 1
-                        elif cycle_return <= -0.5:
-                            halved_count += 1
+                    cycle_pnl = state.cycle.proceeds - state.cycle.buy_cost
+                    hold_days = (rec.date - state.cycle.start_date).days + 1
+                    completed_trades.append(
+                        {
+                            "code": code,
+                            "name": code_name.get(code, rec.name or ""),
+                            "buy_qty": _round2(state.cycle.bought_qty),
+                            "buy_amount": _round2(state.cycle.buy_cost),
+                            "sell_qty": _round2(state.cycle.sold_qty),
+                            "sell_amount": _round2(state.cycle.proceeds),
+                            "pnl": _round2(cycle_pnl),
+                            "holding_days": hold_days,
+                            "start_date": state.cycle.start_date.isoformat(),
+                            "end_date": state.cycle.end_date.isoformat(),
+                            "status": "closed",
+                        }
+                    )
+                    cycle_hold_days_sum += hold_days
+                    cycle_hold_count += 1
+                    if hold_days <= 1:
+                        dist["le_1d"] += 1
+                    elif hold_days <= 5:
+                        dist["2_5d"] += 1
+                    elif hold_days <= 20:
+                        dist["6_20d"] += 1
+                    else:
+                        dist["gt_20d"] += 1
+                    if cycle_pnl > _EPS:
+                        cycle_win_count += 1
+                        cycle_total_profit += cycle_pnl
+                        cycle_max_profit = (
+                            cycle_pnl
+                            if cycle_max_profit is None
+                            else max(cycle_max_profit, cycle_pnl)
+                        )
+                    elif cycle_pnl < -_EPS:
+                        cycle_loss_count += 1
+                        cycle_total_loss += -cycle_pnl
+                        cycle_max_loss = (
+                            cycle_pnl
+                            if cycle_max_loss is None
+                            else min(cycle_max_loss, cycle_pnl)
+                        )
                     state.cycle.remaining_cost = 0.0
                     state.cycle = None
                 update_max_pos(code, rec.name, rec.date)
@@ -848,24 +898,6 @@ def compute_metrics(
         market_value = qty * price
         holding_market_value += market_value
         code_unrealized[code] = market_value - cost
-        # 仍持仓的完整周期：按成本 vs 最新价估算翻倍/腰斩
-        if state.cycle is not None and state.cycle.remaining_cost > _EPS:
-            remaining_qty = state.cycle.bought_qty - state.cycle.sold_qty
-            estimate_price = prices.get(code)
-            if estimate_price is None or estimate_price <= 0:
-                estimate_price = (
-                    state.cycle.remaining_cost / remaining_qty
-                    if remaining_qty > _EPS
-                    else 0.0
-                )
-            estimated_return = (
-                remaining_qty * estimate_price - state.cycle.remaining_cost
-            ) / state.cycle.remaining_cost
-            if estimated_return >= 1.0:
-                double_count += 1
-            elif estimated_return <= -0.5:
-                halved_count += 1
-
     # ---- 收益率（H1 区间口径） ----
     # 主口径：期初资产基准（期初资金 + 期初持仓变现估值）；期初资产为 0（完整历史）
     # 时退化为累计入金基准。辅口径：纯现金期初基准（忽略期初持仓）。
@@ -907,8 +939,14 @@ def compute_metrics(
         turnover["total"] / avg_balance if avg_balance > _EPS else None
     )
     avg_holding_days = (
-        hold_days_wsum / hold_qty_sum if hold_qty_sum > _EPS else None
+        cycle_hold_days_sum / cycle_hold_count if cycle_hold_count else None
     )
+    win_count = cycle_win_count
+    loss_count = cycle_loss_count
+    total_profit = cycle_total_profit
+    total_loss = cycle_total_loss
+    max_profit = cycle_max_profit
+    max_loss = cycle_max_loss
     win_rate = (
         win_count / (win_count + loss_count) if (win_count + loss_count) else None
     )
@@ -944,6 +982,30 @@ def compute_metrics(
                 "drawdown": _round4(drawdown),
             }
         )
+
+    # ---- 账户级翻倍 / 腰斩（按月末近似净值曲线的独立事件计数） ----
+    double_count = 0
+    halved_count = 0
+    run_min: Optional[float] = None
+    run_peak: Optional[float] = None
+    doubled_episode = False
+    halved_episode = False
+    for point in equity_curve:
+        eq = point["equity"] or 0.0
+        if eq <= _EPS:
+            continue
+        if run_min is None or eq < run_min:
+            run_min = eq
+            doubled_episode = False
+        if run_peak is None or eq > run_peak:
+            run_peak = eq
+            halved_episode = False
+        if run_min > _EPS and eq >= run_min * 2.0 and not doubled_episode:
+            double_count += 1
+            doubled_episode = True
+        if run_peak > _EPS and eq <= run_peak * 0.5 and not halved_episode:
+            halved_count += 1
+            halved_episode = True
 
     months = _months_between(start_date, end_date)
     monthly_pnl = [
@@ -992,6 +1054,32 @@ def compute_metrics(
                 "unrealized_pnl": _round2(unrealized),
                 "total_pnl": _round2(total),
                 "trade_count": code_count.get(code, 0),
+            }
+        )
+    stock_stats: List[Dict[str, Any]] = []
+    for code in sorted(code_count, key=lambda c: (-code_turnover[c], c)):
+        first = code_first_date.get(code)
+        last = code_last_date.get(code)
+        realized = code_realized.get(code, 0.0)
+        unrealized = code_unrealized.get(code, 0.0)
+        stock_stats.append(
+            {
+                "code": code,
+                "name": code_name.get(code, ""),
+                "buy_count": code_buy_count.get(code, 0),
+                "buy_qty": _round2(code_buy_qty.get(code, 0.0)),
+                "buy_amount": _round2(code_buy_amount.get(code, 0.0)),
+                "sell_count": code_sell_count.get(code, 0),
+                "sell_qty": _round2(code_sell_qty.get(code, 0.0)),
+                "sell_amount": _round2(code_sell_amount.get(code, 0.0)),
+                "turnover": _round2(code_turnover[code]),
+                "realized_pnl": _round2(realized),
+                "unrealized_pnl": _round2(unrealized),
+                "total_pnl": _round2(realized + unrealized),
+                "first_date": first.isoformat() if first else None,
+                "last_date": last.isoformat() if last else None,
+                "holding_days": (last - first).days + 1 if first and last else 0,
+                "status": "held" if code in held_codes else "closed",
             }
         )
     top_profit = sorted(
@@ -1150,6 +1238,8 @@ def compute_metrics(
                     },
                 },
             },
+            "stocks": stock_stats,
+            "trades": completed_trades,
         }
     )
 
