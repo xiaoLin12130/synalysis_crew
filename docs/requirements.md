@@ -143,11 +143,14 @@ storage: save_analysis(timestamp, meta) / list_analyses() / load_analysis(id)
 
 | Agent | Issue | 唯一写权限 | 只读依赖 |
 |---|---|---|---|
-| A1 | #1 脚手架+解析器 | `pyproject.toml`、`.gitignore`、`.env.example`、`src/synalysis_crew/__init__.py`、`src/synalysis_crew/parser.py`、`tests/test_parser.py`、`tests/fixtures/synthetic_trades.py` | 无 |
+| A1 | #1 解析器 | `src/synalysis_crew/__init__.py`、`src/synalysis_crew/parser.py`、`tests/test_parser.py`、`tests/fixtures/synthetic_trades.py` | 无 |
 | A2 | #2 指标引擎 | `src/synalysis_crew/metrics.py`、`tests/test_metrics.py` | `TradeRecord` 契约（#1 定义，未落地前用本地 stub） |
 | A3 | #3 AI 分析（LangGraph） | `src/synalysis_crew/llm.py`、`analyst.py`、`state.py`、`graph.py`、`tests/test_analyst.py` | `MetricsResult` 契约（#2）、`H:\stock_review_crew\skills`（只读） |
 | A4 | #4 前端 | `app.py`、`src/synalysis_crew/ui.py`、`src/synalysis_crew/storage.py` | 5 个公共函数契约（见第 4 章，开发期用 mock） |
 | A5（Wave 2） | #5 联调收尾 | `README.md`、`tests/test_e2e.py`、`scripts/run.ps1`、合成数据夹具补充 | 全部模块；**集成修复需主 agent 确认后才能改其他文件** |
+
+> `pyproject.toml`、`.gitignore`、`.env.example`、`.env` 由主 agent 预置，任何 agent 不得修改；
+> 任何 agent 不得执行 `git commit`/`git push`、不得修改 `data/` 下真实交割单、不得把真实数据写入仓库。
 
 ### 5.2 交接与防冲突规则
 
