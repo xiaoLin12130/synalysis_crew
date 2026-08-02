@@ -2,6 +2,7 @@
 data/*.xlsx
 data/*.xls
 data/*.csv
+data/analyses/
 
 # 环境变量与密钥
 .env
