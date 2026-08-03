@@ -25,6 +25,7 @@ async function requestJson(path, options) {
     }
     throw new ApiError(detail || `请求失败（HTTP ${res.status}）`);
   }
+  if (res.status === 204) return undefined;
   return res.json();
 }
 
@@ -64,13 +65,51 @@ export async function listAnalyses() {
     const items = await requestJson("/api/analyses");
     return { items, offline: false };
   } catch (err) {
-    if (import.meta.env.DEV) return { items: [], offline: true };
+    if (import.meta.env.DEV) {
+      // 离线演示：返回 mock 历史（任务完成即“入库”，与真实后端一致）
+      const items = [...mockAnalyses.values()]
+        .map((e) => e.record)
+        .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+      return { items, offline: true };
+    }
     throw err;
   }
 }
 
 export function getAnalysis(id) {
+  const key = String(id);
+  const rec = mockAnalyses.get(key);
+  if (rec) return Promise.resolve({ meta: rec.metrics.meta, metrics: rec.metrics, analysis: rec.analysis });
   return requestJson(`/api/analyses/${encodeURIComponent(id)}`);
+}
+
+// DELETE /api/analyses/{id}：成功 204；不存在 404（中文错误由后端给出）
+export async function deleteAnalysis(id) {
+  const key = String(id);
+  // 离线演示：直接删除 mock 历史，模拟 204
+  if (mockAnalyses.has(key)) {
+    mockAnalyses.delete(key);
+    return undefined;
+  }
+  let res;
+  try {
+    res = await fetch(`/api/analyses/${encodeURIComponent(id)}`, { method: "DELETE" });
+  } catch {
+    if (import.meta.env.DEV) return undefined;
+    throw new ApiError("无法连接后端服务，请确认服务已启动");
+  }
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const data = await res.json();
+      detail = (data && (data.detail || data.message || data.error)) || "";
+    } catch {
+      /* 非 JSON 错误体 */
+    }
+    if (import.meta.env.DEV && res.status >= 500) return undefined;
+    throw new ApiError(detail || `删除失败（HTTP ${res.status}）`);
+  }
+  // 204 无内容
 }
 
 // ---------- 离线演示任务（模拟进度，结构同 GET /api/jobs/{id}） ----------
@@ -92,6 +131,30 @@ const MOCK_STEPS = [
 const mockJobs = new Map();
 let mockSeq = 0;
 
+// 离线演示历史存储：任务完成后注册记录，历史列表 / 详情 / 删除全部可用
+const mockAnalyses = new Map();
+let mockRecordSeq = 0;
+
+function registerMockAnalysis(filename) {
+  const built = buildMockResult();
+  const id = `mock-record-${String(++mockRecordSeq).padStart(3, "0")}`;
+  const meta = built.metrics.meta || {};
+  mockAnalyses.set(id, {
+    record: {
+      id,
+      timestamp: new Date().toISOString(),
+      filename: filename || meta.filename || "离线演示.xlsx",
+      total_return_pct: meta.total_return_pct != null ? meta.total_return_pct : 0,
+      is_partial: !!meta.is_partial,
+      label: meta.label || null,
+      tags: Array.isArray(meta.tags) ? meta.tags : [],
+    },
+    metrics: built.metrics,
+    analysis: built.analysis,
+  });
+  return id;
+}
+
 export function startOfflineJob(filename) {
   const jobId = `mock-${Date.now()}-${mockSeq++}`;
   mockJobs.set(jobId, { step: -1, filename: filename || "离线演示.xlsx" });
@@ -105,7 +168,9 @@ function pollMockJob(jobId) {
   const idx = Math.min(job.step, MOCK_STEPS.length - 1);
   const s = MOCK_STEPS[idx];
   if (idx === MOCK_STEPS.length - 1) {
-    const built = buildMockResult();
+    // 与真实后端一致：任务完成即写入历史（仅注册一次）
+    if (!job.recordId) job.recordId = registerMockAnalysis(job.filename);
+    const rec = mockAnalyses.get(job.recordId);
     return {
       job_id: jobId,
       filename: job.filename,
@@ -116,7 +181,7 @@ function pollMockJob(jobId) {
       analysts_done: 5,
       analysts_total: 5,
       error: null,
-      result: { record_id: "mock-record-001", metrics: built.metrics, analysis: built.analysis },
+      result: { record_id: job.recordId, metrics: rec.metrics, analysis: rec.analysis },
     };
   }
   return {

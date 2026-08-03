@@ -36,3 +36,15 @@
 ## 关键文档
 - 需求规格：docs/requirements-v2.md（第六节 = 数据字典，字段唯一真源）
 - 需求 v1：docs/requirements.md；issue 文本：docs/issues.md
+
+## Agent 负责人登记（模块 → agent，后续修改优先 resume 原负责人）
+
+| 模块 | 负责人（昵称/id） | 状态 |
+|---|---|---|
+| 指标引擎 metrics | Raman（019fc551-5877-7ba1-b12c-fb1aa92922bb） | 运行中（v2.2 腰斩递进） |
+| 后端 backend/storage | Tesla（019fc551-590a-7f13-8883-58fccefd89bc） | 已完成待命（v2.2 历史删除，16 tests） |
+| 前端 frontend | Hooke（019fc551-59d0-75e1-90d0-3abc64e63560） | 已完成待命（v2.2 删除/任务保留/排序/按钮收敛，build 通过） |
+| 分析师 analyst/llm/graph | 历史负责人 Averroes（已关闭，可 resume） | 待命 |
+| 解析器 parser | 历史负责人 Nash（已关闭，可 resume） | 待命 |
+
+> 策略：模块负责人任务完成后不立即关闭；同类修改优先 resume；仅当确定不再改动或并发名额不足时才回收。

@@ -9,8 +9,8 @@
 - 收益率（1.0 v2.1 TWR）：逐日模拟、现金以余额为权威、持仓按最近成交价估值、
   期初持仓合成 1:1 跟踪（卖出不产生虚假收益）、出入金不影响收益率本身、
   return_curve 每月末累计 R（无记录月份沿用上一值补齐）；
-- 最大回撤基于逐日 (1+R) 序列；账户级翻倍（R ≥ +100% 独立事件）/腰斩
-  （v ≤ 0.5·v_peak 独立事件，创新高重置）；
+- 最大回撤基于逐日 (1+R) 序列；账户级翻倍（v2.1：R ≥ +100% 独立事件）/腰斩
+  （v2.2 递进式：floor 初始 1.0，新高重置，v ≤ floor×0.5 逐级计数）；
 - 亏损榜 top_loss 升序（亏损最多在前）、top_profit 降序；
 - akshare 最新价成功 / 失败按成本兜底（monkeypatch，不发网络请求）；
 - 固定 JSON Schema（全英文 snake_case、可严格 JSON 序列化），_empty_result 含
@@ -653,7 +653,7 @@ def test_special_operations_excluded_from_trades_and_stats(no_price_fetch):
 
 
 # ---------------------------------------------------------------------------
-# 收益率曲线 / 账户级翻倍腰斩（v2.1 1.0 / 1.4 TWR 逐日模拟）
+# 收益率曲线 / 账户级翻倍腰斩（v2.1 1.0 / v2.2 1.4 TWR 逐日模拟）
 # ---------------------------------------------------------------------------
 
 
@@ -794,10 +794,11 @@ def test_twr_transfers_do_not_affect_return(no_price_fetch):
 
 def test_twr_double_and_halved_events(no_price_fetch):
     """v2.1 1.4：翻倍 = R 从 < 100% 升到 ≥ 100% 的独立事件；
-    腰斩 = v ≤ 0.5 × v_peak 的独立事件（创新高重置，回升过半腰线后重新计数）。
+    腰斩 = v2.2 递进式（floor 初始 1.0，新高重置，v ≤ floor×0.5 逐级计数）。
 
     手算逐日 v：1.0 → 2.0（翻倍#1）→ 1.75 → 2.55（翻倍#2，R 0.75→1.55）
-    → 1.05（腰斩#1，≤ 0.5×2.55=1.275）→ 1.3 → 1.5 → 1.1（腰斩#2）；
+    → 1.05（腰斩#1，≤ 0.5×2.55=1.275，floor 降至 1.05）→ 1.3 → 1.5
+    （回升超过当前 floor，基线重置为 1.5）→ 1.1（> 0.5×1.5=0.75，不再计数）；
     最终 R = 0.1；最大回撤 = (2.55 − 1.05) / 2.55。
     """
     trades = [
@@ -819,11 +820,85 @@ def test_twr_double_and_halved_events(no_price_fetch):
     ]
     m = compute_metrics(trades)
     assert m["pnl"]["double_count"] == 2
-    assert m["pnl"]["halved_count"] == 2
+    assert m["pnl"]["halved_count"] == 1
     assert m["account"]["total_return_rate"] == pytest.approx(0.1, abs=1e-6)
     assert m["pnl"]["max_drawdown"] == pytest.approx((2.55 - 1.05) / 2.55, abs=1e-4)
     assert m["pnl"]["return_curve"] == [
         {"month": "2024-01", "date": "2024-01-18", "return_rate": 0.1},
+    ]
+
+
+def test_count_doublings_hand_sequences():
+    """翻倍保持 v2.1：R ≥ +100% 独立事件（v = 1+R 从 < 2.0 升到 ≥ 2.0 计 1 次）。"""
+    assert metrics_module._count_doublings([1.0, 1.9, 2.0, 2.1, 1.9, 2.0]) == 2
+    assert metrics_module._count_doublings([1.0, 2.0, 1.5, 2.0]) == 2
+    assert metrics_module._count_doublings([1.5, 1.9]) == 0
+    assert metrics_module._count_doublings([]) == 0
+
+
+def test_count_halvings_progressive_consecutive_decline():
+    """v2.2 递进式腰斩：连续下跌 1 → 0.5 → 0.25 → 0.125 逐级计 3 次。"""
+    assert metrics_module._count_halvings([1.0, 0.5, 0.25, 0.125]) == 3
+    assert metrics_module._count_halvings([1.0, 0.5, 0.25, 0.125, 0.0625]) == 4
+
+
+def test_count_halvings_rebound_resets_baseline():
+    """回升超过当前 floor 才重置基线：0.125 后升至 2.0（新高，floor=2.0），
+    再跌到 1.0（≤ 0.5×2.0）计第 4 次。"""
+    assert metrics_module._count_halvings([1.0, 0.5, 0.25, 0.125, 2.0, 1.0]) == 4
+    # 回升到 0.6（> 当前 floor 0.5，但低于历史高点 1.0）也重置基线，
+    # 之后 0.25（≤ 0.5×0.6=0.3）继续逐级计数
+    assert metrics_module._count_halvings([1.0, 0.5, 0.6, 0.25]) == 2
+
+
+def test_count_halvings_mixed_series():
+    """混合涨跌：新高重置 / 部分回撤不计 / 低于 floor 的回升也重置基线。"""
+    # 1.6 新高 → 1.2（>0.8 不计）→ 0.7（#1，floor=0.7）→ 0.9（重置 floor=0.9）
+    # → 2.0（新高 floor=2.0）→ 1.4（>1.0 不计）→ 0.68（#2，≤0.5×2.0）
+    assert metrics_module._count_halvings([1.0, 1.6, 1.2, 0.7, 0.9, 2.0, 1.4, 0.68]) == 2
+
+
+def test_count_halvings_flat_and_equal_boundaries():
+    """等于当前 floor 不重置不计数；平盘不计数；低于 floor 但未到半腰线不计数。"""
+    assert metrics_module._count_halvings([1.0, 0.5, 0.5, 0.4]) == 1
+    assert metrics_module._count_halvings([1.0, 1.0, 1.0]) == 0
+    assert metrics_module._count_halvings([]) == 0
+
+
+def test_twr_halved_progressive_consecutive_decline_v22(no_price_fetch):
+    """v2.2 1.4 端到端（真实交易序列）：连续下跌逐级计数 + 回升新高重置 + 再腰斩。
+
+    手算逐日 v（全仓单票隔日半价换仓，买入日 r=0 平盘）：
+      1.0 → 0.5（腰斩#1）→ 0.5 → 0.25（#2）→ 0.25 → 0.125（#3）→ 0.125
+      → 3.0（翻倍#1，0.125→3.0 越过 2.0）→ 3.0
+      → 1.5（#4，≤ 0.5×3.0）→ 1.5 → 1.2（> 0.5×1.5 不计）→ 1.2
+      → 0.72（#5，≤ 0.5×1.5=0.75，floor 已重置为 1.5）；
+    最终 R = −0.28；最大回撤 = (1.0 − 0.125) / 1.0 = 0.875。
+    """
+    trades = [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
+        T("A", "A股", "BUY", 1000, 10, 10000, 0, date(2024, 1, 3)),
+        T("A", "A股", "SELL", 1000, 5, 5000, 5000, date(2024, 1, 4)),
+        T("A", "A股", "BUY", 1000, 5, 5000, 0, date(2024, 1, 5)),
+        T("A", "A股", "SELL", 1000, 2.5, 2500, 2500, date(2024, 1, 8)),
+        T("A", "A股", "BUY", 1000, 2.5, 2500, 0, date(2024, 1, 9)),
+        T("A", "A股", "SELL", 1000, 1.25, 1250, 1250, date(2024, 1, 10)),
+        T("A", "A股", "BUY", 1000, 1.25, 1250, 0, date(2024, 1, 11)),
+        T("A", "A股", "SELL", 1000, 30, 30000, 30000, date(2024, 1, 12)),
+        T("A", "A股", "BUY", 1000, 30, 30000, 0, date(2024, 1, 15)),
+        T("A", "A股", "SELL", 1000, 15, 15000, 15000, date(2024, 1, 16)),
+        T("A", "A股", "BUY", 1000, 15, 15000, 0, date(2024, 1, 17)),
+        T("A", "A股", "SELL", 1000, 12, 12000, 12000, date(2024, 1, 18)),
+        T("A", "A股", "BUY", 1000, 12, 12000, 0, date(2024, 1, 19)),
+        T("A", "A股", "SELL", 1000, 7.2, 7200, 7200, date(2024, 1, 22)),
+    ]
+    m = compute_metrics(trades)
+    assert m["pnl"]["double_count"] == 1
+    assert m["pnl"]["halved_count"] == 5
+    assert m["account"]["total_return_rate"] == pytest.approx(0.72 - 1, abs=1e-6)
+    assert m["pnl"]["max_drawdown"] == pytest.approx((1.0 - 0.125) / 1.0, abs=1e-6)
+    assert m["pnl"]["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-22", "return_rate": -0.28},
     ]
 
 

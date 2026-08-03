@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -127,3 +128,19 @@ def load_analysis(record_id: Any) -> dict:
         "metrics": _read_json(entry / "metrics.json") or {},
         "analysis": _read_json(entry / "analysis.json") or {},
     }
+
+
+def delete_analysis(record_id: Any) -> bool:
+    """按 id 删除一条历史记录目录（meta.json/metrics.json/analysis.json 一并移除）。
+    非法 id、目录不存在或删除失败均返回 False，绝不抛异常。"""
+    safe = _safe_id(record_id)
+    if safe is None:
+        return False
+    entry = _analyses_root() / safe
+    if not entry.is_dir():
+        return False
+    try:
+        shutil.rmtree(entry)
+    except Exception:
+        return False
+    return True

@@ -29,9 +29,12 @@ v2 口径（与 requirements-v2.md 对齐）：
   也不会扭曲日收益率）。累计 R = Π(1 + r_d) − 1，``total_return_rate`` 主口径 = 最终 R；
   return_curve = 每月末累计 R [{month, date, return_rate}]（无记录月份沿用上一值），
   equity_curve 保留原始净值供调试；**最大回撤/翻倍/腰斩基于逐日 (1 + R) 序列**；
-- 账户级翻倍/腰斩（1.4 v2.1）：翻倍 = 累计 R 达到 +100% 的独立事件（R 从 < 100%
-  升到 ≥ 100% 计 1 次，禁止「从运行低点翻倍」口径——接近归零的账户会产生假阳性）；
-  腰斩 = v ≤ 0.5·v_peak 的独立事件（创新高后重新计数）；
+- 账户级翻倍/腰斩（1.4）：翻倍（v2.1 不变）= 累计 R 达到 +100% 的独立事件
+  （R 从 < 100% 升到 ≥ 100% 计 1 次，禁止「从运行低点翻倍」口径——接近归零的
+  账户会产生假阳性）；腰斩（v2.2 递进式）= floor 初始 1.0，遍历 v = 1 + R 曲线：
+  v > floor → floor = v（新高重置）；v ≤ floor × 0.5 → 计 1 次且 floor = v
+  （1→0.5 第 1 次、0.5→0.25 第 2 次、0.25→0.125 第 3 次，连续下跌逐级计数）；
+  回升超过当前 floor 才重置基线；
 - M6：首行「证券转银行」按其出金额计入现金流转（net_transfer/gross_withdraw/
   月转账），期初资金 = 余额 + 出金额；
 - 区间口径：期初资金 != 0 或期初有持仓（文件内先卖后买）时 ``is_partial=True``。
@@ -69,7 +72,9 @@ v2 口径（与 requirements-v2.md 对齐）：
 - ``win_rate/盈亏比/持仓周期`` 均按**完整交易**统计，每闭环计一笔：
   周期盈亏 = 卖出净额 − 买入成本（含费用）；
 - ``double_count/halved_count`` 为**账户级**：按逐日 v = 1 + R 序列统计
-  「R 从 < 100% 升到 ≥ 100% 的翻倍」与「v ≤ 0.5·v_peak 的腰斩（创新高重置）」；
+  「R 从 < 100% 升到 ≥ 100% 的翻倍（v2.1）」与「递进式腰斩（v2.2：floor 初始
+  1.0，v > floor → floor = v 新高重置；v ≤ floor × 0.5 → 计 1 次且 floor = v，
+  连续下跌逐级计数；回升超过当前 floor 才重置基线）」；
 - ``top_loss`` 按 total_pnl **升序**（亏损最多在前），``top_profit`` 降序；
 - 金额四舍五入到 2 位、比率到 4 位；非有限数输出 None，保证严格 JSON 序列化；
 - 无配对持仓的卖出（期初持仓）记入 ``unmatched_sell_amount``，不计入已实现盈亏与胜率。
@@ -206,6 +211,43 @@ def _round4(value: float) -> Optional[float]:
     result = round(value, 4)
     # 归一化 -0.0 -> 0.0，保证 JSON 输出与前端展示一致
     return 0.0 if result == 0 else result
+
+
+def _count_doublings(vs: Sequence[float]) -> int:
+    """v2.1 翻倍次数：累计 R 达到 +100% 的独立事件（v = 1+R 从 < 2.0 升到 ≥ 2.0 计 1 次）。
+
+    禁止「从运行低点翻倍」口径——接近归零的账户会产生假阳性。
+    """
+    count = 0
+    above_double = False
+    for v in vs:
+        if v >= 2.0:
+            if not above_double:
+                count += 1
+                above_double = True
+        else:
+            above_double = False
+    return count
+
+
+def _count_halvings(vs: Sequence[float]) -> int:
+    """v2.2 递进式腰斩次数（1.4，用户确认）：逐日遍历 v = 1 + R 曲线。
+
+    - floor 初始 = 1.0（初始净值）；
+    - v > floor → floor = v（新高重置基线）；
+    - v ≤ floor × 0.5 → 计 1 次且 floor = v（1→0.5 第 1 次、0.5→0.25 第 2 次、
+      0.25→0.125 第 3 次，连续下跌逐级计数）；
+    - 回升超过当前 floor 才重置基线（低于历史高点的回升也按新 floor 继续计数）。
+    """
+    count = 0
+    floor = 1.0
+    for v in vs:
+        if v > floor:
+            floor = v
+        elif v <= floor * 0.5:
+            count += 1
+            floor = v
+    return count
 
 
 def _months_between(start: date, end: date) -> List[str]:
@@ -1143,34 +1185,14 @@ def compute_metrics(
             peak_v = v
         max_drawdown = max(max_drawdown, (peak_v - v) / peak_v)
 
-    # ---- 账户级翻倍 / 腰斩（1.4 v2.1）：逐日 v = 1 + R 序列 ----
-    # 翻倍：累计 R 从 < 100% 升到 ≥ 100% 计 1 次独立事件
-    #（禁止「从运行低点翻倍」——接近归零的账户会产生假阳性）。
-    double_count = 0
-    above_double = False
-    for v in daily_v:
-        if v >= 2.0:
-            if not above_double:
-                double_count += 1
-                above_double = True
-        else:
-            above_double = False
-
-    # 腰斩：v ≤ 0.5 × v_peak 的独立事件；创新高重置，回升过半腰线后重新计数。
-    # 运行峰值起点同样为 v0 = 1.0。
-    halved_count = 0
-    run_peak = 1.0
-    below_half = False
-    for v in daily_v:
-        if v > run_peak:
-            run_peak = v
-            below_half = False
-        if v <= run_peak * 0.5:
-            if not below_half:
-                halved_count += 1
-                below_half = True
-        else:
-            below_half = False
+    # ---- 账户级翻倍 / 腰斩（1.4）：逐日 v = 1 + R 序列 ----
+    # 翻倍（v2.1 不变）：累计 R 从 < 100% 升到 ≥ 100% 计 1 次独立事件
+    #（禁止「从运行低点翻倍」——接近归零的账户会产生假阳性）；
+    # 腰斩（v2.2 递进式）：floor 初始 1.0，v > floor → floor = v（新高重置），
+    # v ≤ floor × 0.5 → 计 1 次且 floor = v（连续下跌逐级计数），
+    # 回升超过当前 floor 才重置基线。
+    double_count = _count_doublings(daily_v)
+    halved_count = _count_halvings(daily_v)
 
     # ---- v2.1 收益率：主口径 = 逐日 TWR 最终 R ----
     total_return_rate = None if not daily_v else cum_v - 1.0

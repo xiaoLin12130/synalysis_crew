@@ -3,6 +3,7 @@
 - POST /api/analyze：multipart 上传，落盘 .tmp/uploads/{uuid}.xlsx，异步任务返回 {job_id}
 - GET  /api/jobs/{job_id}：任务状态（queued/running/done/error）+ 分步进度
 - GET  /api/analyses、/api/analyses/{id}：历史记录（非法 id → 404）
+- DELETE /api/analyses/{id}：删除历史记录（成功 204 无 body；非法/不存在 → 404 中文）
 - GET  /api/health；frontend/dist 存在时静态托管前端
 
 任务线程：parse_trades → compute_metrics → analyze(progress 回调) → save_analysis；
@@ -24,7 +25,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -34,7 +35,12 @@ sys.path.insert(0, str(ROOT / "src"))
 from synalysis_crew.graph import analyze  # noqa: E402
 from synalysis_crew.metrics import compute_metrics  # noqa: E402
 from synalysis_crew.parser import ParseError, parse_trades  # noqa: E402
-from synalysis_crew.storage import list_analyses, load_analysis, save_analysis  # noqa: E402
+from synalysis_crew.storage import (  # noqa: E402
+    delete_analysis,
+    list_analyses,
+    load_analysis,
+    save_analysis,
+)
 
 app = FastAPI(title="Synalysis Crew API", version="0.2.0")
 app.add_middleware(
@@ -295,6 +301,14 @@ def analysis(record_id: str) -> dict[str, Any]:
     if not record.get("meta"):
         raise HTTPException(status_code=404, detail="记录不存在")
     return record
+
+
+@app.delete("/api/analyses/{record_id}", status_code=204)
+def delete_record(record_id: str) -> Response:
+    """删除历史分析记录：成功 204（无 body）；非法/不存在 → 404 中文。"""
+    if not delete_analysis(record_id):
+        raise HTTPException(status_code=404, detail="记录不存在")
+    return Response(status_code=204)
 
 
 DIST = ROOT / "frontend" / "dist"

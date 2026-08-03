@@ -43,6 +43,7 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import synalysis_crew.metrics as metrics_module  # noqa: E402
+import synalysis_crew.storage as storage_module  # noqa: E402
 
 import backend.main as main  # noqa: E402
 from synthetic_trades import build_xlsx  # noqa: E402
@@ -239,6 +240,78 @@ def test_invalid_record_404(client):
         resp = client.get(f"/api/analyses/{bad_id}")
         assert resp.status_code == 404, bad_id
         assert "记录不存在" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# v2.2 历史记录删除：DELETE /api/analyses/{id}（H2）
+# ---------------------------------------------------------------------------
+
+
+def _save_delete_fixture(stamp: str) -> str:
+    """在隔离目录直接落一条含 meta/metrics/analysis 的记录，返回 record id。"""
+    return storage_module.save_analysis(
+        {
+            "filename": "delete-me.xlsx",
+            "total_return_pct": 0.25,
+            "is_partial": False,
+            "label": "总收益",
+            "tags": ["删除测试"],
+            "metrics": {"meta": {"is_partial": False}},
+            "analysis": {"final_report": "# 删除测试", "degraded": True},
+        },
+        timestamp=stamp,
+    )
+
+
+def test_delete_analysis_204_list_and_dir_gone(client, iso_dir):
+    record_id = _save_delete_fixture("20990101-000000")
+    entry = iso_dir / "analyses" / record_id
+    for name in ("meta.json", "metrics.json", "analysis.json"):
+        assert (entry / name).is_file(), name
+
+    # 删除前：历史列表包含该记录
+    assert record_id in {r["id"] for r in client.get("/api/analyses").json()}
+
+    resp = client.delete(f"/api/analyses/{record_id}")
+    assert resp.status_code == 204
+    assert resp.content == b""  # 成功无 body
+
+    # meta/metrics/analysis 所在目录一并删除
+    assert not entry.exists()
+    # 删除后：历史列表不再包含
+    assert record_id not in {r["id"] for r in client.get("/api/analyses").json()}
+
+
+def test_delete_analysis_again_404(client, iso_dir):
+    record_id = _save_delete_fixture("20990101-000001")
+    assert client.delete(f"/api/analyses/{record_id}").status_code == 204
+
+    resp = client.delete(f"/api/analyses/{record_id}")
+    assert resp.status_code == 404
+    assert "记录不存在" in resp.json()["detail"]
+
+
+def test_delete_analysis_invalid_id_404(client):
+    for bad_id in ("does-not-exist", "..%5Cevil", "bad%20id", "bad;id"):
+        resp = client.delete(f"/api/analyses/{bad_id}")
+        assert resp.status_code == 404, bad_id
+        assert "记录不存在" in resp.json()["detail"]
+
+
+def test_delete_analysis_isolated_from_repo_data(client, iso_dir):
+    """SYNALYSIS_DATA_DIR 隔离：删除只作用于隔离目录，不碰仓库 data/analyses。"""
+    repo_root = _PROJECT_ROOT / "data" / "analyses"
+    before = sorted(p.name for p in repo_root.iterdir()) if repo_root.is_dir() else []
+
+    record_id = _save_delete_fixture("20990101-000002")
+    assert (iso_dir / "analyses" / record_id).is_dir()
+    assert record_id not in before  # 隔离目录中的记录本就不在仓库里
+
+    assert client.delete(f"/api/analyses/{record_id}").status_code == 204
+    assert not (iso_dir / "analyses" / record_id).exists()
+
+    after = sorted(p.name for p in repo_root.iterdir()) if repo_root.is_dir() else []
+    assert after == before
 
 
 # ---------------------------------------------------------------------------

@@ -245,7 +245,8 @@ def _v2_checklist_trades() -> list[TradeRecord]:
 
     v2.1 TWR 逐日 v 序列：[1.0, 1.5, 1.5, 1.5, 0.825, 0.825, 1.95, 1.95, 1.5]
     （2/1 转账 5000 日 r=0，出入金不产生收益）→ 月末 R = [0.5, -0.175, 0.95, 0.5]；
-    峰值 1.95 < 2.0 无翻倍、最低 0.825 > 0.75(=0.5×1.5) 无腰斩；
+    峰值 1.95 < 2.0 无翻倍、最低 0.825 > 0.75(=0.5×1.5) 无腰斩
+    （v2.2 递进式 floor 口径同样为 0）；
     最大回撤 = (1.5 - 0.825) / 1.5 = 0.45；主口径 R = 0.5。
     """
     return [
@@ -357,7 +358,7 @@ def test_metrics_result_covers_all_32_requirement_items(no_price_fetch):
                   m["pnl"]["max_single_loss"] == pytest.approx(-9000.0))),
         ("20 账户翻倍次数（v2.1：R ≥ +100% 独立事件，峰值 1.95 < 2 → 0）",
          lambda: m["pnl"]["double_count"] == 0),
-        ("21 账户腰斩次数（v2.1：v ≤ 0.5×v_peak 独立事件，最低 0.825 > 0.75 → 0）",
+        ("21 账户腰斩次数（v2.2 递进式：floor 初始 1.0，最低 0.825 > 0.75 → 0）",
          lambda: m["pnl"]["halved_count"] == 0),
         ("22 月度盈亏序列",
          lambda: m["pnl"]["monthly_pnl"] == [
@@ -575,10 +576,11 @@ def _tr(code, name, op, qty, price, amount, balance, d) -> TradeRecord:
 
 
 def test_twr_double_halved_events_hand_check(no_price_fetch):
-    """v2.1 1.4 翻倍/腰斩（真实 TradeRecord 集成手算）。
+    """v2.2 1.4 翻倍/腰斩（真实 TradeRecord 集成手算）。
 
     逐日 v：1.0 → 2.0（翻倍#1）→ 1.75 → 2.55（翻倍#2）→ 1.05（腰斩#1）
-    → 1.3 → 1.5 → 1.1（腰斩#2）；最终 R = 0.1；回撤 = (2.55−1.05)/2.55。
+    → 1.3 → 1.5（回升超过当前 floor 1.05，基线重置）→ 1.1（> 0.75 不再计）；
+    最终 R = 0.1；回撤 = (2.55−1.05)/2.55。
     """
     trades = [
         _tr("", "", OpType.BANK_TO_SEC, 0, 0, 0, 10000, date(2024, 1, 2)),
@@ -600,7 +602,7 @@ def test_twr_double_halved_events_hand_check(no_price_fetch):
     m = compute_metrics(trades)
     assert m["account"]["total_return_rate"] == pytest.approx(0.1, abs=1e-4)
     assert m["pnl"]["double_count"] == 2
-    assert m["pnl"]["halved_count"] == 2
+    assert m["pnl"]["halved_count"] == 1
     assert m["pnl"]["max_drawdown"] == pytest.approx((2.55 - 1.05) / 2.55, abs=1e-4)
     assert m["pnl"]["return_curve"] == [
         {"month": "2024-01", "date": "2024-01-18", "return_rate": 0.1},

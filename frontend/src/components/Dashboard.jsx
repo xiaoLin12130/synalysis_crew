@@ -38,7 +38,7 @@ function Overview({ metrics }) {
   );
 }
 
-export default function Dashboard({ result, onNew }) {
+export default function Dashboard({ result }) {
   const [tab, setTab] = useState("overview");
   const metrics = result.metrics || {};
   const meta = result.meta || {};
@@ -59,7 +59,6 @@ export default function Dashboard({ result, onNew }) {
               : null}
           </div>
         </div>
-        <button className="btn btn-outline btn-sm" onClick={onNew}>＋ 新建分析</button>
       </div>
 
       <div className="tabs">

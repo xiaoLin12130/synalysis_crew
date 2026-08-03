@@ -47,13 +47,22 @@ export default function App() {
       return false;
     }
   });
+  // 视图：upload（上传页） | progress（进度页） | dashboard（结果页）
   const [view, setView] = useState("upload");
+  // job 全局保留：切换视图不停止轮询、不丢失运行中任务（需求 1.8）
   const [job, setJob] = useState(null);
+  // 后台任务完成后的结果，供侧栏「查看分析结果」一键返回
+  const [jobResult, setJobResult] = useState(null);
   const [result, setResult] = useState(null);
   const [history, setHistory] = useState({ items: [], loading: true, error: null, offline: false });
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState(null);
   const pollRef = useRef(null);
+  const viewRef = useRef(view);
+
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
@@ -79,13 +88,12 @@ export default function App() {
 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
+  // 「新建分析」（侧栏唯一入口）：只切换视图，进行中的任务继续轮询不丢失
   const handleNew = useCallback(() => {
-    stopPolling();
-    setJob(null);
     setResult(null);
     setDetailError(null);
     setView("upload");
-  }, [stopPolling]);
+  }, []);
 
   const beginPolling = useCallback(
     (jobId, filename, offlineFlag) => {
@@ -101,15 +109,20 @@ export default function App() {
               const r = snap.result || {};
               // M8：job result 无 meta 时回退 metrics.meta（区间徽章/分析区间）
               const metrics = normalizeMetrics(r.metrics);
-              setResult({
+              const fresh = {
                 record_id: r.record_id || jobId,
                 filename: snap.filename || filename,
                 metrics,
                 analysis: normalizeAnalysis(r.analysis),
                 meta: r.meta || metrics.meta || {},
                 offline: offlineFlag,
-              });
-              setView("dashboard");
+              };
+              setJobResult(fresh);
+              // 停留在进度页则自动进入结果页；其他视图由侧栏指示器一键返回
+              if (viewRef.current === "progress") {
+                setResult(fresh);
+                setView("dashboard");
+              }
               loadHistory();
             }
           }
@@ -129,6 +142,7 @@ export default function App() {
   const handleUpload = useCallback(
     async (file) => {
       setDetailError(null);
+      setJobResult(null);
       setJob({
         id: null,
         filename: file.name,
@@ -140,6 +154,7 @@ export default function App() {
         analysts_total: 0,
         offline: false,
       });
+      setView("progress");
       try {
         const res = await api.analyzeFile(file);
         beginPolling(res.job_id, file.name, !!res.offline);
@@ -152,6 +167,7 @@ export default function App() {
 
   const handleDemo = useCallback(() => {
     setDetailError(null);
+    setJobResult(null);
     setJob({
       id: null,
       filename: "离线演示.xlsx",
@@ -163,14 +179,14 @@ export default function App() {
       analysts_total: 0,
       offline: true,
     });
+    setView("progress");
     const res = api.startOfflineJob("离线演示.xlsx");
     beginPolling(res.job_id, "离线演示.xlsx", true);
   }, [beginPolling]);
 
+  // 运行中点击历史记录：只切换展示内容，轮询继续（需求 1.8）
   const handleSelectHistory = useCallback(
     async (id) => {
-      stopPolling();
-      setJob(null);
       setDetailError(null);
       setDetailLoading(true);
       try {
@@ -194,8 +210,34 @@ export default function App() {
         setDetailLoading(false);
       }
     },
-    [stopPolling, history.items]
+    [history.items]
   );
+
+  // 删除历史记录：成功后刷新列表；删除当前正在查看的记录回到上传页（需求 1.8）
+  const handleDeleteHistory = useCallback(
+    async (id) => {
+      await api.deleteAnalysis(id);
+      await loadHistory();
+      if (result && result.record_id != null && String(result.record_id) === String(id)) {
+        setResult(null);
+        setDetailError(null);
+        setView("upload");
+      }
+    },
+    [loadHistory, result]
+  );
+
+  // 侧栏指示器：进行中 → 回到进度页；已完成 → 查看结果页
+  const handleBackToJob = useCallback(() => {
+    if (!job) return;
+    if (job.status === "done" && jobResult) {
+      setResult(jobResult);
+      setJob(null);
+      setView("dashboard");
+      return;
+    }
+    setView("progress");
+  }, [job, jobResult]);
 
   const toggleCollapsed = useCallback(() => {
     setCollapsed((c) => {
@@ -209,14 +251,13 @@ export default function App() {
     });
   }, []);
 
-  const jobRunning = job && (job.status === "queued" || job.status === "running");
-  const jobError = job && job.status === "error";
-  const showUpload = !jobRunning && !jobError && (view === "upload" || !result);
-  const title = showUpload
-    ? "上传交割单"
-    : result
-      ? `分析结果${result.filename ? ` · ${result.filename}` : ""}`
-      : "上传交割单";
+  const jobActive = job && (job.status === "queued" || job.status === "running");
+  const title =
+    view === "progress" && job
+      ? "分析进行中"
+      : view === "dashboard" && result
+        ? `分析结果${result.filename ? ` · ${result.filename}` : ""}`
+        : "上传交割单";
 
   return (
     <ErrorBoundary onReset={handleNew}>
@@ -228,15 +269,21 @@ export default function App() {
           activeId={result ? result.record_id : null}
           onSelect={handleSelectHistory}
           onNew={handleNew}
+          job={job}
+          onBackToJob={handleBackToJob}
+          onDelete={handleDeleteHistory}
         />
         <main className="main">
           <header className="topbar">
             <div className="topbar-title">
               {title}
-              {result && result.meta && result.meta.is_partial ? <span className="badge partial topbar-badge">区间分析</span> : null}
-              {result && result.offline ? <span className="pill offline topbar-badge">离线演示</span> : null}
+              {view === "dashboard" && result && result.meta && result.meta.is_partial ? (
+                <span className="badge partial topbar-badge">区间分析</span>
+              ) : null}
+              {view === "dashboard" && result && result.offline ? (
+                <span className="pill offline topbar-badge">离线演示</span>
+              ) : null}
             </div>
-            <button className="btn btn-outline btn-sm" onClick={handleNew}>＋ 新建分析</button>
           </header>
           <div className="content">
             {detailLoading ? (
@@ -254,13 +301,13 @@ export default function App() {
                   <button className="btn btn-accent" onClick={handleNew}>返回上传页</button>
                 </div>
               </div>
-            ) : jobRunning || jobError ? (
+            ) : view === "progress" && job ? (
               <ProgressOverlay job={job} onNew={handleNew} />
-            ) : showUpload ? (
-              <UploadView onUpload={handleUpload} onDemo={handleDemo} busy={!!job} />
-            ) : result ? (
-              <Dashboard result={result} onNew={handleNew} />
-            ) : null}
+            ) : view === "dashboard" && result ? (
+              <Dashboard result={result} />
+            ) : (
+              <UploadView onUpload={handleUpload} onDemo={handleDemo} busy={!!jobActive} />
+            )}
           </div>
         </main>
       </div>
