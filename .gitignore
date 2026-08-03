@@ -25,3 +25,6 @@ py_mkdir_test/
 # 前端依赖与构建产物
 frontend/node_modules/
 frontend/dist/
+
+# 本地提示词文档（不提交）
+docs/改造stock_review_crew提示词.md
