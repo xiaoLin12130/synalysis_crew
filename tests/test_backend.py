@@ -83,6 +83,7 @@ def iso_dir():
 def client(iso_dir, monkeypatch):
     """TestClient + 存储隔离：SYNALYSIS_DATA_DIR → .tmp/ 临时目录。"""
     monkeypatch.setenv("SYNALYSIS_DATA_DIR", str(iso_dir / "analyses"))
+    monkeypatch.setenv("SYNALYSIS_PUBLIC_MODE", "")  # 其余用例默认关闭公网无历史模式
     with TestClient(main.app) as test_client:
         yield test_client
 
@@ -312,6 +313,46 @@ def test_delete_analysis_isolated_from_repo_data(client, iso_dir):
 
     after = sorted(p.name for p in repo_root.iterdir()) if repo_root.is_dir() else []
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# 公网无历史模式：SYNALYSIS_PUBLIC_MODE=1
+# ---------------------------------------------------------------------------
+
+
+def test_public_mode_analysis_no_record(client, iso_dir, no_price_fetch, monkeypatch):
+    """公网无历史模式：分析照常完成，但不落盘（record_id=null），历史列表恒空。"""
+    monkeypatch.setenv("SYNALYSIS_PUBLIC_MODE", "1")
+    xlsx = build_xlsx(iso_dir / "public.xlsx")
+
+    resp = client.post(
+        "/api/analyze",
+        files={
+            "file": (
+                "public.xlsx",
+                xlsx.read_bytes(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    job = _poll_job(client, resp.json()["job_id"])
+
+    # 分析任务正常执行并返回完整结果
+    assert job["status"] == "done"
+    assert job["pct"] == 100
+    result = job["result"]
+    assert result is not None
+    assert result["record_id"] is None  # 公网模式不落盘
+    assert result["analysis"]["final_report"]
+    assert result["metrics"]["account"]
+    assert result["meta"]["filename"] == "public.xlsx"
+
+    # 历史列表恒空，且隔离目录内无记录落盘
+    assert client.get("/api/analyses").json() == []
+    assert not (iso_dir / "analyses").exists() or not any(
+        (iso_dir / "analyses").iterdir()
+    )
 
 
 # ---------------------------------------------------------------------------

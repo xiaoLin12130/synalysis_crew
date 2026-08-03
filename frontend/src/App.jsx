@@ -165,25 +165,6 @@ export default function App() {
     [beginPolling]
   );
 
-  const handleDemo = useCallback(() => {
-    setDetailError(null);
-    setJobResult(null);
-    setJob({
-      id: null,
-      filename: "离线演示.xlsx",
-      status: "queued",
-      stage: "queued",
-      pct: 0,
-      message: "正在启动离线演示…",
-      analysts_done: 0,
-      analysts_total: 0,
-      offline: true,
-    });
-    setView("progress");
-    const res = api.startOfflineJob("离线演示.xlsx");
-    beginPolling(res.job_id, "离线演示.xlsx", true);
-  }, [beginPolling]);
-
   // 运行中点击历史记录：只切换展示内容，轮询继续（需求 1.8）
   const handleSelectHistory = useCallback(
     async (id) => {
@@ -281,7 +262,7 @@ export default function App() {
                 <span className="badge partial topbar-badge">区间分析</span>
               ) : null}
               {view === "dashboard" && result && result.offline ? (
-                <span className="pill offline topbar-badge">离线演示</span>
+                <span className="pill offline topbar-badge">离线 mock</span>
               ) : null}
             </div>
           </header>
@@ -306,7 +287,7 @@ export default function App() {
             ) : view === "dashboard" && result ? (
               <Dashboard result={result} />
             ) : (
-              <UploadView onUpload={handleUpload} onDemo={handleDemo} busy={!!jobActive} />
+              <UploadView onUpload={handleUpload} busy={!!jobActive} />
             )}
           </div>
         </main>

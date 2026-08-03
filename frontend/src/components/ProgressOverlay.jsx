@@ -22,7 +22,7 @@ export default function ProgressOverlay({ job, onNew }) {
       <div className="progress-head">
         <div className="spinner" />
         <div className="progress-title">正在分析「{job.filename || "交割单"}」</div>
-        {job.offline ? <span className="pill offline">离线演示模式</span> : null}
+        {job.offline ? <span className="pill offline">离线 mock 模式（DEV 降级）</span> : null}
       </div>
       <p className="card-sub">后端任务每 1 秒自动刷新进度，请勿关闭页面</p>
 

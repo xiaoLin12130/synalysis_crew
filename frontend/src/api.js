@@ -1,5 +1,5 @@
-// API 客户端：fetch 封装 + 离线演示数据（mock 结构完全符合 v2 API 契约）
-// 上传与历史使用真实接口；开发期（DEV）后端不可用时自动降级为离线演示。
+// API 客户端：fetch 封装 + 离线 mock（仅 DEV 后端不可用时的降级数据，无 UI 入口）
+// 上传与历史使用真实接口；开发期（DEV）后端不可用时自动降级为离线 mock。
 
 export class ApiError extends Error {
   constructor(message) {
@@ -32,7 +32,7 @@ async function requestJson(path, options) {
     res = await fetchWithTimeout(path, options);
   } catch (err) {
     if (err instanceof ApiError) throw err; // 超时等已带中文信息
-    throw new ApiError("无法连接后端服务，请确认服务已启动（也可点击「载入演示数据」离线预览）");
+    throw new ApiError("无法连接后端服务，请确认服务已启动");
   }
   if (!res.ok) {
     let detail = "";
@@ -56,7 +56,7 @@ export async function analyzeFile(file) {
   try {
     res = await fetchWithTimeout("/api/analyze", { method: "POST", body: form });
   } catch (err) {
-    // 开发期：连接失败 / 超时均自动降级为离线演示，避免界面永久卡在提交态
+    // 开发期：连接失败 / 超时均自动降级为离线 mock，避免界面永久卡在提交态
     if (import.meta.env.DEV) return startOfflineJob(file.name);
     if (err instanceof ApiError) throw err;
     throw new ApiError("无法连接后端服务，请确认服务已启动");
@@ -69,7 +69,7 @@ export async function analyzeFile(file) {
     } catch {
       /* 非 JSON 错误体 */
     }
-    // 开发期后端未启动（vite 代理返回 5xx）时自动进入离线演示
+    // 开发期后端未启动（vite 代理返回 5xx）时自动降级为离线 mock
     if (import.meta.env.DEV && res.status >= 500) return startOfflineJob(file.name);
     throw new ApiError(detail || `上传失败（HTTP ${res.status}），请检查文件格式`);
   }
@@ -87,7 +87,7 @@ export async function listAnalyses() {
     return { items, offline: false };
   } catch (err) {
     if (import.meta.env.DEV) {
-      // 离线演示：返回 mock 历史（任务完成即“入库”，与真实后端一致）
+      // 离线 mock：返回 mock 历史（任务完成即“入库”，与真实后端一致）
       const items = [...mockAnalyses.values()]
         .map((e) => e.record)
         .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
@@ -107,7 +107,7 @@ export function getAnalysis(id) {
 // DELETE /api/analyses/{id}：成功 204；不存在 404（中文错误由后端给出）
 export async function deleteAnalysis(id) {
   const key = String(id);
-  // 离线演示：直接删除 mock 历史，模拟 204
+  // 离线 mock：直接删除 mock 历史，模拟 204
   if (mockAnalyses.has(key)) {
     mockAnalyses.delete(key);
     return undefined;
@@ -133,7 +133,7 @@ export async function deleteAnalysis(id) {
   // 204 无内容
 }
 
-// ---------- 离线演示任务（模拟进度，结构同 GET /api/jobs/{id}） ----------
+// ---------- 离线 mock 任务（模拟进度，结构同 GET /api/jobs/{id}；仅 DEV 降级使用） ----------
 const MOCK_STEPS = [
   { stage: "parse_trades", pct: 12, msg: "正在解析交割单文件…" },
   { stage: "parse_trades", pct: 25, msg: "解析完成，识别到 38 条成交记录" },
@@ -152,19 +152,19 @@ const MOCK_STEPS = [
 const mockJobs = new Map();
 let mockSeq = 0;
 
-// 离线演示历史存储：任务完成后注册记录，历史列表 / 详情 / 删除全部可用
+// 离线 mock 历史存储：任务完成后注册记录，历史列表 / 详情 / 删除全部可用
 const mockAnalyses = new Map();
 let mockRecordSeq = 0;
 
 function registerMockAnalysis(filename) {
-  const built = buildMockResult();
+  const built = buildMockResult(filename);
   const id = `mock-record-${String(++mockRecordSeq).padStart(3, "0")}`;
   const meta = built.metrics.meta || {};
   mockAnalyses.set(id, {
     record: {
       id,
       timestamp: new Date().toISOString(),
-      filename: filename || meta.filename || "离线演示.xlsx",
+      filename: filename || meta.filename || "交割单.xlsx",
       total_return_pct: meta.total_return_pct != null ? meta.total_return_pct : 0,
       is_partial: !!meta.is_partial,
       label: meta.label || null,
@@ -178,7 +178,7 @@ function registerMockAnalysis(filename) {
 
 export function startOfflineJob(filename) {
   const jobId = `mock-${Date.now()}-${mockSeq++}`;
-  mockJobs.set(jobId, { step: -1, filename: filename || "离线演示.xlsx" });
+  mockJobs.set(jobId, { step: -1, filename: filename || "交割单.xlsx" });
   return { job_id: jobId, offline: true };
 }
 
@@ -288,7 +288,7 @@ function buildEventArrays(returnCurve) {
   return { doubleEvents, halvedEvents };
 }
 
-function buildMockMetrics() {
+function buildMockMetrics(filename) {
   const rng = mulberry32(20260802);
   const startBase = new Date(2025, 2, 3); // 2025-03-03
   const trades = [];
@@ -590,7 +590,7 @@ function buildMockMetrics() {
     total_return_pct: round6(totalReturnRate), // 小数比率（0.5 = 50%）
     label: "完整周期",
     tags: ["演示数据", "离线预览"],
-    filename: "离线演示.xlsx",
+    filename: filename || "交割单.xlsx",
   };
 
   return { account, trading, pnl, behavior, stocks, trades, meta };
@@ -712,7 +712,7 @@ function buildMockAnalysis(m) {
   };
 }
 
-function buildMockResult() {
-  const metrics = buildMockMetrics();
+function buildMockResult(filename) {
+  const metrics = buildMockMetrics(filename);
   return { metrics, analysis: buildMockAnalysis(metrics) };
 }

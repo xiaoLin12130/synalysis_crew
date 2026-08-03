@@ -5,6 +5,8 @@
 - GET  /api/analyses、/api/analyses/{id}：历史记录（非法 id → 404）
 - DELETE /api/analyses/{id}：删除历史记录（成功 204 无 body；非法/不存在 → 404 中文）
 - GET  /api/health；frontend/dist 存在时静态托管前端
+- 公网无历史模式：SYNALYSIS_PUBLIC_MODE=1 时分析照常执行但不落盘（result.record_id=null），
+  GET /api/analyses 恒返回 []（不读历史目录）；未设置/非 1 时行为不变
 
 任务线程：parse_trades → compute_metrics → analyze(progress 回调) → save_analysis；
 所有异常转为 status=error + 中文 message，绝不 500 崩线程；上传临时文件用后即删。
@@ -63,6 +65,12 @@ JOBS: dict[str, dict[str, Any]] = {}
 # graph.analyze 内部使用模块级进度钩子，多任务并发时会互相覆盖；
 # 用本锁串行化 analyze 调用，保证每个 job 的进度回调只写自己的 JOBS 条目。
 _ANALYZE_LOCK = threading.Lock()
+
+
+def _public_mode() -> bool:
+    """公网无历史模式开关：SYNALYSIS_PUBLIC_MODE=1 时分析不落盘、历史列表恒空。
+    动态读取环境变量（不缓存），便于测试切换。"""
+    return os.getenv("SYNALYSIS_PUBLIC_MODE", "").strip() == "1"
 
 
 def _max_upload_bytes() -> int:
@@ -146,7 +154,10 @@ def _run_job(job_id: str, path: Path, filename: str) -> None:
             "label": "区间收益" if metrics["meta"].get("is_partial") else "总收益",
             "tags": (res.get("overall_tags") or [])[:3],
         }
-        record_id = save_analysis({**meta, "metrics": metrics, "analysis": res})
+        if _public_mode():
+            record_id = None  # 公网无历史模式：不调用 save_analysis，不落盘
+        else:
+            record_id = save_analysis({**meta, "metrics": metrics, "analysis": res})
         _update(
             job_id,
             status="done",
@@ -272,6 +283,8 @@ def analyses() -> list[dict[str, Any]]:
     契约注释：total_return_pct 为**小数比率**（0.5 = 50%，与
     metrics.account.total_return_rate 一致），前端负责 ×100 展示；
     is_partial/label/tags 供区间徽章与标签渲染。"""
+    if _public_mode():
+        return []  # 公网无历史模式：不读历史目录，恒返回空列表
     result: list[dict[str, Any]] = []
     for item in list_analyses():
         if not isinstance(item, dict):

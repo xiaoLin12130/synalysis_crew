@@ -87,7 +87,7 @@ export default function Sidebar({ collapsed, onToggle, history, activeId, onSele
           <div className="sidebar-empty">{history.error}</div>
         ) : items.length === 0 ? (
           history.offline ? (
-            <div className="sidebar-empty">后端未连接，历史记录暂不可用（离线预览）</div>
+            <div className="sidebar-empty">后端未连接，历史记录暂不可用</div>
           ) : (
             <div className="sidebar-empty">
               暂无历史分析记录

@@ -1,6 +1,6 @@
 import React, { useRef, useState } from "react";
 
-export default function UploadView({ onUpload, onDemo, busy }) {
+export default function UploadView({ onUpload, busy }) {
   const [drag, setDrag] = useState(false);
   const [file, setFile] = useState(null);
   const [error, setError] = useState("");
@@ -84,9 +84,6 @@ export default function UploadView({ onUpload, onDemo, busy }) {
       <div className="upload-actions">
         <button className="btn btn-accent" disabled={busy || !file} onClick={submit}>
           {busy ? "正在提交…" : "开始分析"}
-        </button>
-        <button className="btn btn-ghost" disabled={busy} onClick={onDemo}>
-          载入演示数据（离线预览）
         </button>
       </div>
 
