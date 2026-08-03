@@ -108,6 +108,7 @@ export function fmtQty(v) {
 
 export function moneyClass(v) {
   const n = num(v, NaN);
-  if (!Number.isFinite(n) || n === 0) return "";
+  if (!Number.isFinite(n)) return "";
+  if (n === 0) return "zero"; // v2.3：零值中性灰
   return n > 0 ? "pos" : "neg";
 }

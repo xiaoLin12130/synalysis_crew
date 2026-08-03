@@ -138,7 +138,7 @@ export default function Sidebar({ collapsed, onToggle, history, activeId, onSele
                 </div>
                 <div className="hist-name" title={it.filename}>{it.filename || "未命名分析"}</div>
                 <div className="hist-return">
-                  <span className={ret == null ? "" : ret >= 0 ? "pos" : "neg"}>{retText}</span>
+                  <span className={ret == null ? "" : ret > 0 ? "pos" : ret < 0 ? "neg" : "zero"}>{retText}</span>
                   {it.label ? <span className="tag-chip">{it.label}</span> : null}
                 </div>
                 {it.tags && it.tags.length ? (

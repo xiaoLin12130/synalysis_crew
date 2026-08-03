@@ -357,9 +357,11 @@ def test_metrics_result_covers_all_32_requirement_items(no_price_fetch):
          lambda: (m["pnl"]["max_single_profit"] == pytest.approx(15000.0) and
                   m["pnl"]["max_single_loss"] == pytest.approx(-9000.0))),
         ("20 账户翻倍次数（v2.1：R ≥ +100% 独立事件，峰值 1.95 < 2 → 0）",
-         lambda: m["pnl"]["double_count"] == 0),
+         lambda: (m["pnl"]["double_count"] == 0 and
+                  m["pnl"]["double_events"] == [])),
         ("21 账户腰斩次数（v2.2 递进式：floor 初始 1.0，最低 0.825 > 0.75 → 0）",
-         lambda: m["pnl"]["halved_count"] == 0),
+         lambda: (m["pnl"]["halved_count"] == 0 and
+                  m["pnl"]["halved_events"] == [])),
         ("22 月度盈亏序列",
          lambda: m["pnl"]["monthly_pnl"] == [
              {"month": "2024-01", "pnl": 5000.0},
@@ -396,7 +398,8 @@ def test_metrics_result_covers_all_32_requirement_items(no_price_fetch):
         # ---- D. 行为画像（4 项）----
         ("28 持仓周期分布（按完整交易）",
          lambda: m["behavior"]["holding_period_distribution"] == {
-             "le_1d": 0, "2_5d": 1, "6_20d": 3, "gt_20d": 0,
+             "d1": 0, "d2_3": 1, "d4_5": 0, "d6_10": 3,
+             "d11_20": 0, "d21_30": 0, "d31_60": 0, "gt60": 0,
          }),
         ("29 月度交易活跃度",
          lambda: m["behavior"]["monthly_activity"] == [
@@ -455,7 +458,8 @@ def test_metrics_midstream_key_numbers(no_price_fetch):
     assert m["pnl"]["max_single_loss"] == 0.0
     assert m["trading"]["avg_holding_period_days"] is None
     assert m["behavior"]["holding_period_distribution"] == {
-        "le_1d": 0, "2_5d": 0, "6_20d": 0, "gt_20d": 0,
+        "d1": 0, "d2_3": 0, "d4_5": 0, "d6_10": 0,
+        "d11_20": 0, "d21_30": 0, "d31_60": 0, "gt60": 0,
     }
     assert m["pnl"]["double_count"] == 0
     assert m["pnl"]["halved_count"] == 0
@@ -603,6 +607,13 @@ def test_twr_double_halved_events_hand_check(no_price_fetch):
     assert m["account"]["total_return_rate"] == pytest.approx(0.1, abs=1e-4)
     assert m["pnl"]["double_count"] == 2
     assert m["pnl"]["halved_count"] == 1
+    assert m["pnl"]["double_events"] == [
+        {"date": "2024-01-04", "return_rate": 1.0},
+        {"date": "2024-01-08", "return_rate": 1.55},
+    ]
+    assert m["pnl"]["halved_events"] == [
+        {"date": "2024-01-10", "return_rate": 0.05},
+    ]
     assert m["pnl"]["max_drawdown"] == pytest.approx((2.55 - 1.05) / 2.55, abs=1e-4)
     assert m["pnl"]["return_curve"] == [
         {"month": "2024-01", "date": "2024-01-18", "return_rate": 0.1},

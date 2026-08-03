@@ -59,7 +59,12 @@ export default function UploadView({ onUpload, onDemo, busy }) {
           type="file"
           accept=".xlsx,.xls"
           style={{ display: "none" }}
-          onChange={(e) => pick(e.target.files && e.target.files[0])}
+          onChange={(e) => {
+            const f = e.target.files && e.target.files[0];
+            // 重置 value：允许再次选择同一个文件（否则 onChange 不会触发）
+            e.target.value = "";
+            pick(f);
+          }}
         />
       </div>
 

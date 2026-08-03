@@ -30,8 +30,10 @@ button, input, select { font-family: inherit; }
 button { cursor: pointer; }
 a { color: var(--accent); }
 
-.pos { color: #0d9f78; }
-.neg { color: var(--danger); }
+/* v2.3 红涨绿跌：正收益红、负收益绿、零值中性灰（警示色不参与） */
+.pos { color: #e03131; }
+.neg { color: #0ca678; }
+.zero { color: #868e96; }
 .num { font-variant-numeric: tabular-nums; }
 
 /* ---------- 布局 ---------- */
@@ -218,8 +220,9 @@ a { color: var(--accent); }
 .hist-name { font-size: 13px; margin: 2px 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hist-return { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; }
 
-.sidebar .pos { color: #4ade80; }
-.sidebar .neg { color: #f87171; }
+.sidebar .pos { color: #f87171; }
+.sidebar .neg { color: #4ade80; }
+.sidebar .zero { color: #8b919c; }
 
 .hist-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 5px; }
 
@@ -331,6 +334,10 @@ a { color: var(--accent); }
 .kpi.hl-accent .kpi-value { color: var(--accent); }
 .kpi.hl-danger { border-color: #f3c9cb; background: linear-gradient(135deg, #fdeeef, #fbf6f6); }
 .kpi.hl-danger .kpi-value { color: var(--danger); }
+.kpi.hl-up { border-color: #f3c9cb; background: linear-gradient(135deg, #fdeeef, #fbf6f6); }
+.kpi.hl-up .kpi-value { color: #e03131; }
+.kpi.hl-down { border-color: #bfe6d8; background: linear-gradient(135deg, #e6f6f1, #f6fcfa); }
+.kpi.hl-down .kpi-value { color: #0ca678; }
 
 /* ---------- Tabs ---------- */
 .tabs {
@@ -639,8 +646,29 @@ a { color: var(--accent); }
 .hl-num { font-size: 30px; font-weight: 800; font-variant-numeric: tabular-nums; }
 .hl-card.accent .hl-num { color: var(--accent); }
 .hl-card.danger .hl-num { color: var(--danger); }
+.hl-card.up { background: linear-gradient(135deg, #fdeeef, #fbf4f4); border-color: #f3c9cb; }
+.hl-card.up .hl-num { color: #e03131; }
+.hl-card.down { background: linear-gradient(135deg, #e6f6f1, #f2fbf8); border-color: #bfe6d8; }
+.hl-card.down .hl-num { color: #0ca678; }
 .hl-unit { font-size: 16px; font-weight: 600; }
 .hl-sub { font-size: 11.5px; color: var(--text-2); margin-top: 8px; line-height: 1.6; }
+
+/* ---------- 翻倍 / 腰斩事件清单 ---------- */
+.event-list { display: flex; flex-direction: column; gap: 8px; }
+.event-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fbfbfa;
+}
+.event-badge { font-size: 11px; font-weight: 700; padding: 2px 10px; border-radius: 99px; white-space: nowrap; }
+.event-badge.double { background: #fdecec; color: #e03131; }
+.event-badge.halved { background: #e6f6f1; color: #0ca678; }
+.event-date { font-size: 13px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.event-rate { margin-left: auto; font-weight: 700; font-variant-numeric: tabular-nums; }
 
 .rank-list { display: flex; flex-direction: column; gap: 12px; }
 .rank-row { }

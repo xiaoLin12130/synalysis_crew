@@ -59,6 +59,33 @@
   盈亏、持股天数、起止日期、状态；
 - 列头点击可排序（至少支持：盈亏、盈亏比例、持股天数、买入金额，升降序切换）。
 
+### 2.0 翻倍/腰斩事件明细与曲线标注（v2.3）
+- `pnl.double_events / pnl.halved_events`：事件数组 `[{date: "YYYY-MM-DD", return_rate: 小数}]`，
+  日期取**逐日 TWR 模拟**中触发阈值的实际交易日（非月末）；`double_count/halved_count` = 数组长度。
+- 前端：收益率曲线图上用标记点标出翻倍/腰斩事件（tooltip 显示日期与当时累计收益率）；
+  盈亏分析 Tab 列出事件清单（如「腰斩：2024-02-01，累计收益 -54.7%」）。
+
+### 2.1 红涨绿跌（v2.3）
+- 所有盈亏相关展示（KPI 数值、表格盈亏列、月度盈亏柱、盈亏分布、标签颜色）：
+  **正收益 = 红色（#E03131 系），负收益 = 绿色（#0CA678 系）**，零值中性灰；
+- 警告/错误/免责声明框保持原有警示色（红色系语义不变），不参与红涨绿跌。
+
+### 2.2 盈亏分布细化（v2.3，前端从 trades[].pnl 计算）
+- 分箱步长 **500 元**：`(n*500, (n+1)*500]` 正区间、`[-(n+1)*500, -n*500)` 负区间，
+  含 0 档 `(-500, 500]`（或对称口径，前端实现取一种并保证不重叠）；
+- 超出 ±10000 的合并为开区间档（≤-10000 / >10000）；柱色红涨绿跌。
+
+### 2.3 持仓周期分布细化（v2.3，后端口径）
+- `behavior.holding_period_distribution` 键改为 8 档：
+  `{d1, d2_3, d4_5, d6_10, d11_20, d21_30, d31_60, gt60}`，
+  中文标签：`1天 / 2-3天 / 4-5天 / 6-10天 / 11-20天 / 21-30天 / 31-60天 / >60天`；
+- 统计口径不变（完整交易 holding_days）。
+
+### 2.4 访问控制（v2.5 已取消）
+- 多用户/密码体系经用户评估后**取消**（2026-08-03 用户决定），保持开放访问：
+- 知道公网地址的人可使用并查看共享历史；**原始交割单分析完即删**；
+- 使用提醒：公网地址不要公开分享；如后续需要隔离/认证再另行设计。
+
 ### 1.5 总收益率（保留 v1 已确认口径）
 - 主口径 `total_return_rate`：期初资产基准 `(期末资产 − A0 − 净转入)/A0`；A0=0 退化累计入金基准。
 - 辅口径 `total_return_rate_net`：纯现金期初基准。
@@ -112,8 +139,10 @@ GET  /api/jobs/{job_id} →
           double_count, halved_count, unmatched_sell_amount,
           monthly_pnl[], equity_curve[], return_curve[], max_drawdown,
           stock_leaderboard{top_profit[], top_loss[]}}
-    behavior: {holding_period_distribution, monthly_activity[], max_position,
+    behavior: {holding_period_distribution{d1,d2_3,d4_5,d6_10,d11_20,d21_30,d31_60,gt60},
+               monthly_activity[], max_position,
                top5_concentration, favorite_stocks_top10[], style, special_operations}
+    pnl 增加: double_events[{date,return_rate}], halved_events[{date,return_rate}]
     stocks: [{code,name,buy_count,sell_count,buy_amount,sell_amount,realized_pnl,
               unrealized_pnl,total_pnl,first_date,last_date,holding_days,status}]
     trades: [{code,name,buy_qty,buy_amount,sell_qty,sell_amount,pnl,

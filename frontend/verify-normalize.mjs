@@ -47,14 +47,46 @@ assert.equal(legacy.analysts[0].analysis, "旧内容");
 assert.equal(legacy.debate[0].responses[0].skill_name, "张三");
 assert.equal(legacy.debate[0].responses[0].response, "旧观点");
 
-// ---- S2：holding_period_distribution dict → 数组 + 中文标签 ----
-const dist = normalizeHoldingPeriodDistribution({ le_1d: 3, "2_5d": 2, "6_20d": 4, gt_20d: 1 });
+// ---- S2/v2.3：holding_period_distribution 8 档 dict → 数组 + 中文标签 ----
+const dist = normalizeHoldingPeriodDistribution({ d1: 3, d2_3: 2, d4_5: 4, d6_10: 1, d11_20: 0, d21_30: 5, d31_60: 2, gt60: 1 });
 assert.deepEqual(dist, [
-  { label: "≤1天", count: 3 },
-  { label: "2–5天", count: 2 },
-  { label: "6–20天", count: 4 },
-  { label: ">20天", count: 1 },
+  { label: "1天", count: 3 },
+  { label: "2-3天", count: 2 },
+  { label: "4-5天", count: 4 },
+  { label: "6-10天", count: 1 },
+  { label: "11-20天", count: 0 },
+  { label: "21-30天", count: 5 },
+  { label: "31-60天", count: 2 },
+  { label: ">60天", count: 1 },
 ]);
+
+// ---- v2.3：旧 4 档 dict 回退映射（旧聚合无法拆分，按档位近似归并）----
+const oldDist = normalizeHoldingPeriodDistribution({ le_1d: 3, "2_5d": 2, "6_20d": 4, gt_20d: 1 });
+assert.deepEqual(oldDist, [
+  { label: "1天", count: 3 },
+  { label: "2-3天", count: 2 },
+  { label: "4-5天", count: 0 },
+  { label: "6-10天", count: 4 },
+  { label: "11-20天", count: 0 },
+  { label: "21-30天", count: 0 },
+  { label: "31-60天", count: 0 },
+  { label: ">60天", count: 1 },
+]);
+
+// ---- v2.3：翻倍/腰斩事件数组归一化；数据未就绪 → 空数组（图表优雅降级）----
+const mEvents = normalizeMetrics({
+  pnl: {
+    double_events: [{ date: "2025-10-31", return_rate: 1.0 }],
+    halved_events: [{ date: "2025-04-30", return_rate: -0.56 }],
+  },
+});
+assert.equal(mEvents.pnl.double_events.length, 1);
+assert.equal(mEvents.pnl.double_events[0].date, "2025-10-31");
+assert.equal(mEvents.pnl.double_events[0].return_rate, 1.0);
+assert.equal(mEvents.pnl.halved_events[0].date, "2025-04-30");
+assert.equal(mEvents.pnl.halved_events[0].return_rate, -0.56);
+assert.deepEqual(normalizeMetrics({}).pnl.double_events, []);
+assert.deepEqual(normalizeMetrics({}).pnl.halved_events, []);
 
 // ---- S2/M7：metrics 归一化（dict 形状、null 比率保留 NaN 不落 0）----
 const m = normalizeMetrics({
@@ -67,7 +99,7 @@ const m = normalizeMetrics({
   },
   trading: { avg_holding_period_days: null },
   behavior: {
-    holding_period_distribution: { le_1d: 1, "2_5d": 0, "6_20d": 0, gt_20d: 0 },
+    holding_period_distribution: { d1: 1, d2_3: 0, d4_5: 0, d6_10: 0, d11_20: 0, d21_30: 0, d31_60: 0, gt60: 0 },
     monthly_activity: [{ month: "2025-03", total_count: 8, buy_count: 4, sell_count: 4 }],
     max_position: { ratio: 0.23, code: "600519", name: "贵州茅台", date: "2025-06-12" },
     top5_concentration: 0.42,
@@ -82,10 +114,14 @@ assert.ok(Number.isNaN(m.pnl.win_rate));
 assert.ok(Number.isNaN(m.pnl.win_count));
 assert.ok(Number.isNaN(m.trading.avg_holding_period_days));
 assert.deepEqual(m.behavior.holding_period_distribution, [
-  { label: "≤1天", count: 1 },
-  { label: "2–5天", count: 0 },
-  { label: "6–20天", count: 0 },
-  { label: ">20天", count: 0 },
+  { label: "1天", count: 1 },
+  { label: "2-3天", count: 0 },
+  { label: "4-5天", count: 0 },
+  { label: "6-10天", count: 0 },
+  { label: "11-20天", count: 0 },
+  { label: "21-30天", count: 0 },
+  { label: "31-60天", count: 0 },
+  { label: ">60天", count: 0 },
 ]);
 assert.equal(m.behavior.monthly_activity[0].count, 8);
 assert.equal(m.behavior.max_position.ratio, 0.23);

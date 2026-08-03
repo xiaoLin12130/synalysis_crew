@@ -1,10 +1,16 @@
 import React, { useEffect, useMemo, useRef } from "react";
 import * as echarts from "echarts";
 import { fmtMonth, fmtSignedMoney, num } from "../format";
+import { buildPnlDistribution } from "../pnlUtils";
 
 const ACCENT = "#10A37F";
 const DANGER = "#e5484d";
+// v2.3 红涨绿跌：正收益红、负收益绿、零值中性灰
+const UP_RED = "#e03131";
+const DOWN_GREEN = "#0ca678";
+const NEUTRAL = "#adb5bd";
 const TEXT2 = "#7a7f87";
+const pnlBarColor = (v) => (v > 0 ? UP_RED : v < 0 ? DOWN_GREEN : NEUTRAL);
 
 const baseTooltip = {
   backgroundColor: "#fff",
@@ -43,7 +49,7 @@ export function Chart({ option, height = 320, emptyText = "暂无数据" }) {
   return <div ref={ref} style={{ width: "100%", height }} />;
 }
 
-export function ReturnCurveChart({ curve }) {
+export function ReturnCurveChart({ curve, events }) {
   const rows = useMemo(
     () =>
       (Array.isArray(curve) ? curve : [])
@@ -55,6 +61,14 @@ export function ReturnCurveChart({ curve }) {
         .filter((p) => Number.isFinite(p.r)), // null 收益率不伪造为 0
     [curve]
   );
+  const doubleEvents = useMemo(
+    () => (events && Array.isArray(events.doubleEvents) ? events.doubleEvents : []),
+    [events]
+  );
+  const halvedEvents = useMemo(
+    () => (events && Array.isArray(events.halvedEvents) ? events.halvedEvents : []),
+    [events]
+  );
   const drawdown = useMemo(() => {
     let peak = -Infinity;
     return rows.map((d) => {
@@ -63,8 +77,49 @@ export function ReturnCurveChart({ curve }) {
     });
   }, [rows]);
 
+  // 事件日期为实际触发日（可能与月末曲线点不同）：就近对齐到曲线点
+  const nearestIndex = (date) => {
+    if (!date) return -1;
+    const t = Date.parse(String(date));
+    if (!Number.isFinite(t)) return -1;
+    let best = -1;
+    let bestDist = Infinity;
+    rows.forEach((r, i) => {
+      const rt = Date.parse(r.date || "");
+      if (!Number.isFinite(rt)) return;
+      const d = Math.abs(rt - t);
+      if (d < bestDist) {
+        bestDist = d;
+        best = i;
+      }
+    });
+    return best;
+  };
+
+  const doublePts = useMemo(
+    () =>
+      doubleEvents
+        .map((e) => ({ e, index: nearestIndex(e.date) }))
+        .filter((p) => p.index >= 0 && Number.isFinite(Number(p.e.return_rate)))
+        .map((p) => ({ ...p, y: num((Number(p.e.return_rate) * 100).toFixed(3)) })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [doubleEvents, rows]
+  );
+  const halvedPts = useMemo(
+    () =>
+      halvedEvents
+        .map((e) => ({ e, index: nearestIndex(e.date) }))
+        .filter((p) => p.index >= 0 && Number.isFinite(Number(p.e.return_rate)))
+        .map((p) => ({ ...p, y: num((Number(p.e.return_rate) * 100).toFixed(3)) })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [halvedEvents, rows]
+  );
+
   const option = useMemo(() => {
     if (!rows.length) return { series: [] };
+    const legend = ["累计收益率", "回撤"];
+    if (doublePts.length) legend.push("翻倍事件");
+    if (halvedPts.length) legend.push("腰斩事件");
     return {
       color: [ACCENT, DANGER],
       tooltip: {
@@ -77,7 +132,7 @@ export function ReturnCurveChart({ curve }) {
           return `<b>${r.month}</b>（${r.date}）<br/>累计收益率：<b>${(r.r * 100).toFixed(2)}%</b><br/>回撤：${(dd * 100).toFixed(2)}%`;
         },
       },
-      legend: { data: ["累计收益率", "回撤"], top: 4, textStyle: { color: TEXT2, fontSize: 12 } },
+      legend: { data: legend, top: 4, textStyle: { color: TEXT2, fontSize: 12 } },
       grid: { left: 58, right: 58, top: 44, bottom: 30 },
       xAxis: {
         type: "category",
@@ -137,9 +192,51 @@ export function ReturnCurveChart({ curve }) {
           itemStyle: { color: DANGER },
           areaStyle: { opacity: 0.06 },
         },
+        ...(doublePts.length
+          ? [
+              {
+                name: "翻倍事件",
+                type: "scatter",
+                data: doublePts.map((p) => [p.index, p.y]),
+                symbol: "diamond",
+                symbolSize: 15,
+                itemStyle: { color: UP_RED, borderColor: "#fff", borderWidth: 2 },
+                label: { show: true, formatter: "翻倍", position: "top", color: UP_RED, fontSize: 11, fontWeight: 700 },
+                z: 20,
+                tooltip: {
+                  trigger: "item",
+                  formatter(params) {
+                    const p = doublePts[params.dataIndex];
+                    return `<b style="color:${UP_RED}">翻倍事件</b><br/>日期：${p.e.date}<br/>累计收益率：${(Number(p.e.return_rate) * 100).toFixed(2)}%`;
+                  },
+                },
+              },
+            ]
+          : []),
+        ...(halvedPts.length
+          ? [
+              {
+                name: "腰斩事件",
+                type: "scatter",
+                data: halvedPts.map((p) => [p.index, p.y]),
+                symbol: "triangle",
+                symbolSize: 15,
+                itemStyle: { color: DOWN_GREEN, borderColor: "#fff", borderWidth: 2 },
+                label: { show: true, formatter: "腰斩", position: "top", color: DOWN_GREEN, fontSize: 11, fontWeight: 700 },
+                z: 20,
+                tooltip: {
+                  trigger: "item",
+                  formatter(params) {
+                    const p = halvedPts[params.dataIndex];
+                    return `<b style="color:${DOWN_GREEN}">腰斩事件</b><br/>日期：${p.e.date}<br/>累计收益率：${(Number(p.e.return_rate) * 100).toFixed(2)}%`;
+                  },
+                },
+              },
+            ]
+          : []),
       ],
     };
-  }, [rows, drawdown]);
+  }, [rows, drawdown, doublePts, halvedPts]);
 
   return <Chart option={option} height={340} emptyText="暂无收益率数据" />;
 }
@@ -158,7 +255,7 @@ export function MonthlyPnlChart({ monthly }) {
         formatter(params) {
           const i = params[0].dataIndex;
           const v = rows[i].pnl;
-          return `<b>${rows[i].month}</b><br/>盈亏：<b style="color:${v >= 0 ? ACCENT : DANGER}">${fmtSignedMoney(v)}</b>`;
+          return `<b>${rows[i].month}</b><br/>盈亏：<b style="color:${pnlBarColor(v)}">${fmtSignedMoney(v)}</b>`;
         },
       },
       grid: { left: 70, right: 18, top: 24, bottom: 30 },
@@ -184,7 +281,7 @@ export function MonthlyPnlChart({ monthly }) {
           data: rows.map((d) => ({
             value: num(d.pnl.toFixed(2)),
             itemStyle: {
-              color: d.pnl >= 0 ? ACCENT : DANGER,
+              color: pnlBarColor(d.pnl),
               borderRadius: d.pnl >= 0 ? [3, 3, 0, 0] : [0, 0, 3, 3],
             },
           })),
@@ -195,28 +292,9 @@ export function MonthlyPnlChart({ monthly }) {
   return <Chart option={option} height={340} emptyText="暂无月度盈亏数据" />;
 }
 
-const PNL_BUCKETS = [
-  { min: -Infinity, max: -10000, label: "亏损 ≥ 1万" },
-  { min: -10000, max: -3000, label: "亏损 3千–1万" },
-  { min: -3000, max: -1000, label: "亏损 1千–3千" },
-  { min: -1000, max: 0, label: "亏损 0–1千" },
-  { min: 0, max: 1000, label: "盈利 0–1千" },
-  { min: 1000, max: 3000, label: "盈利 1千–3千" },
-  { min: 3000, max: 10000, label: "盈利 3千–1万" },
-  { min: 10000, max: Infinity, label: "盈利 ≥ 1万" },
-];
-
 export function PnlDistributionChart({ trades }) {
-  const rows = useMemo(() => {
-    const list = (Array.isArray(trades) ? trades : []).filter(
-      (t) => t.pnl != null && Number.isFinite(Number(t.pnl))
-    );
-    return PNL_BUCKETS.map((b, bi) => ({
-      label: b.label,
-      count: list.filter((t) => Number(t.pnl) >= b.min && Number(t.pnl) < b.max).length,
-      negative: bi < 4,
-    }));
-  }, [trades]);
+  // v2.3：500 元步长分箱（超出 ±10000 合并开区间），柱色红涨绿跌
+  const rows = useMemo(() => buildPnlDistribution(trades), [trades]);
 
   const option = useMemo(() => {
     if (!rows.some((r) => r.count > 0)) return { series: [] };
@@ -234,7 +312,7 @@ export function PnlDistributionChart({ trades }) {
         type: "category",
         data: rows.map((r) => r.label),
         axisLine: { lineStyle: { color: "#d8dad5" } },
-        axisLabel: { color: TEXT2, fontSize: 11, interval: 0, rotate: 24 },
+        axisLabel: { color: TEXT2, fontSize: 10, rotate: 45 },
       },
       yAxis: {
         type: "value",
@@ -250,7 +328,10 @@ export function PnlDistributionChart({ trades }) {
           label: { show: true, position: "top", fontSize: 11, color: TEXT2 },
           data: rows.map((r) => ({
             value: r.count,
-            itemStyle: { color: r.negative ? DANGER : ACCENT, borderRadius: [3, 3, 0, 0] },
+            itemStyle: {
+              color: r.positive ? UP_RED : r.zero ? NEUTRAL : DOWN_GREEN,
+              borderRadius: [3, 3, 0, 0],
+            },
           })),
         },
       ],

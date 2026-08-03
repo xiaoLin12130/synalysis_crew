@@ -1,5 +1,5 @@
 import React from "react";
-import { fmtCny, fmtCount, fmtPct, fmtRatio, fmtSignedCny, moneyClass } from "../format";
+import { fmtCny, fmtCount, fmtDate, fmtPct, fmtRatio, fmtSignedCny, moneyClass } from "../format";
 import { PnlDistributionChart } from "./Charts";
 
 function RankCard({ title, note, rows, negative }) {
@@ -41,6 +41,13 @@ export default function PnlAnalysis({ metrics }) {
   const pnl = metrics.pnl || {};
   const leaderboard = pnl.stock_leaderboard || {};
   const closed = (Array.isArray(metrics.trades) ? metrics.trades : []).filter((t) => t.pnl != null);
+  // v2.3：翻倍/腰斩事件清单（按日期升序）
+  const eventList = [
+    ...(Array.isArray(pnl.double_events) ? pnl.double_events.map((e) => ({ ...e, type: "double" })) : []),
+    ...(Array.isArray(pnl.halved_events) ? pnl.halved_events.map((e) => ({ ...e, type: "halved" })) : []),
+  ]
+    .filter((e) => e && e.date)
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
 
   const stats = [
     // M7：无完整交易时 win_rate/win_count/loss_count 为 null → 「—」
@@ -82,7 +89,7 @@ export default function PnlAnalysis({ metrics }) {
       </div>
 
       <div className="grid grid-2">
-        <div className="hl-card accent">
+        <div className="hl-card up">
           <div className="hl-label">账户翻倍次数</div>
           <div className="hl-num">
             {pnl.double_count ?? 0}
@@ -90,7 +97,7 @@ export default function PnlAnalysis({ metrics }) {
           </div>
           <div className="hl-sub">基于收益率曲线：累计收益率达到 +100% 记为一次独立翻倍</div>
         </div>
-        <div className="hl-card danger">
+        <div className="hl-card down">
           <div className="hl-label">账户腰斩次数</div>
           <div className="hl-num">
             {pnl.halved_count ?? 0}
@@ -101,8 +108,28 @@ export default function PnlAnalysis({ metrics }) {
       </div>
 
       <div className="card">
+        <h3 className="card-title">翻倍 / 腰斩事件</h3>
+        <p className="card-sub">基于 TWR 收益率曲线逐日模拟的事件明细（日期为触发阈值当日）</p>
+        {eventList.length === 0 ? (
+          <div className="empty">本期无翻倍 / 腰斩事件</div>
+        ) : (
+          <div className="event-list">
+            {eventList.map((e, i) => (
+              <div key={`${e.type}-${e.date}-${i}`} className={`event-item ${e.type}`}>
+                <span className={`event-badge ${e.type}`}>{e.type === "double" ? "翻倍" : "腰斩"}</span>
+                <span className="event-date">{fmtDate(e.date)}</span>
+                <span className={`event-rate ${e.type === "double" ? "pos" : "neg"}`}>
+                  {fmtPct(e.return_rate, { signed: true })}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="card">
         <h3 className="card-title">盈亏分布</h3>
-        <p className="card-sub">按完整交易（已清仓）的单笔盈亏分档统计</p>
+        <p className="card-sub">按完整交易（已清仓）的单笔盈亏分档统计（500 元步长，超出 ±1 万合并开区间）</p>
         <PnlDistributionChart trades={closed} />
       </div>
 

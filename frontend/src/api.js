@@ -8,11 +8,30 @@ export class ApiError extends Error {
   }
 }
 
+const REQUEST_TIMEOUT_MS = 30000;
+
+// 带超时的 fetch：杜绝「正在提交文件…」无限卡死（AbortController 中止后抛中文超时错误）
+async function fetchWithTimeout(path, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(path, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new ApiError(`请求超时（${Math.round(timeoutMs / 1000)} 秒），请检查后端服务后重试`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function requestJson(path, options) {
   let res;
   try {
-    res = await fetch(path, options);
-  } catch {
+    res = await fetchWithTimeout(path, options);
+  } catch (err) {
+    if (err instanceof ApiError) throw err; // 超时等已带中文信息
     throw new ApiError("无法连接后端服务，请确认服务已启动（也可点击「载入演示数据」离线预览）");
   }
   if (!res.ok) {
@@ -35,9 +54,11 @@ export async function analyzeFile(file) {
   form.append("file", file);
   let res;
   try {
-    res = await fetch("/api/analyze", { method: "POST", body: form });
-  } catch {
+    res = await fetchWithTimeout("/api/analyze", { method: "POST", body: form });
+  } catch (err) {
+    // 开发期：连接失败 / 超时均自动降级为离线演示，避免界面永久卡在提交态
     if (import.meta.env.DEV) return startOfflineJob(file.name);
+    if (err instanceof ApiError) throw err;
     throw new ApiError("无法连接后端服务，请确认服务已启动");
   }
   if (!res.ok) {
@@ -248,6 +269,25 @@ const round2 = (v) => Math.round(v * 100) / 100;
 const round4 = (v) => Math.round(v * 1e4) / 1e4;
 const round6 = (v) => Math.round(v * 1e6) / 1e6;
 
+// v2.3：按 1.4 口径从收益率曲线生成翻倍/腰斩事件（与后端 metrics 算法一致）
+function buildEventArrays(returnCurve) {
+  const doubleEvents = [];
+  const halvedEvents = [];
+  let prevV = 1;
+  let floor = 1;
+  for (const p of returnCurve) {
+    const v = 1 + (Number(p && p.return_rate) || 0);
+    if (prevV < 2 && v >= 2) doubleEvents.push({ date: p.date, return_rate: p.return_rate });
+    if (v > floor) floor = v;
+    else if (v <= floor * 0.5) {
+      halvedEvents.push({ date: p.date, return_rate: p.return_rate });
+      floor = v;
+    }
+    prevV = v;
+  }
+  return { doubleEvents, halvedEvents };
+}
+
 function buildMockMetrics() {
   const rng = mulberry32(20260802);
   const startBase = new Date(2025, 2, 3); // 2025-03-03
@@ -368,13 +408,17 @@ function buildMockMetrics() {
   }
   const monthlyActivity = [...actMap.values()].sort((a, b) => (a.month < b.month ? -1 : 1));
 
-  // S2：持仓周期分布按后端 Schema 输出 dict {le_1d, 2_5d, 6_20d, gt_20d}
-  const holdingPeriodDistribution = { le_1d: 0, "2_5d": 0, "6_20d": 0, gt_20d: 0 };
+  // v2.3：持仓周期分布按后端 Schema 输出 8 档 dict {d1, d2_3, d4_5, d6_10, d11_20, d21_30, d31_60, gt60}
+  const holdingPeriodDistribution = { d1: 0, d2_3: 0, d4_5: 0, d6_10: 0, d11_20: 0, d21_30: 0, d31_60: 0, gt60: 0 };
   for (const t of closed) {
-    if (t.holding_days <= 1) holdingPeriodDistribution.le_1d += 1;
-    else if (t.holding_days <= 5) holdingPeriodDistribution["2_5d"] += 1;
-    else if (t.holding_days <= 20) holdingPeriodDistribution["6_20d"] += 1;
-    else holdingPeriodDistribution.gt_20d += 1;
+    if (t.holding_days <= 1) holdingPeriodDistribution.d1 += 1;
+    else if (t.holding_days <= 3) holdingPeriodDistribution.d2_3 += 1;
+    else if (t.holding_days <= 5) holdingPeriodDistribution.d4_5 += 1;
+    else if (t.holding_days <= 10) holdingPeriodDistribution.d6_10 += 1;
+    else if (t.holding_days <= 20) holdingPeriodDistribution.d11_20 += 1;
+    else if (t.holding_days <= 30) holdingPeriodDistribution.d21_30 += 1;
+    else if (t.holding_days <= 60) holdingPeriodDistribution.d31_60 += 1;
+    else holdingPeriodDistribution.gt60 += 1;
   }
 
   const pick = (g) => ({
@@ -413,7 +457,8 @@ function buildMockMetrics() {
 
   const months = ["2025-03", "2025-04", "2025-05", "2025-06", "2025-07", "2025-08", "2025-09", "2025-10", "2025-11"];
   const monthEnds = ["2025-03-31", "2025-04-30", "2025-05-31", "2025-06-30", "2025-07-31", "2025-08-31", "2025-09-30", "2025-10-31", endDate];
-  const equities = [497000, 521000, 561000, 538000, 592000, 689000, 655000, 718000, totalAssets];
+  // v2.3：曲线包含一次腰斩（2025-04）与一次翻倍（2025-10），用于演示事件标注
+  const equities = [497000, 220000, 561000, 538000, 592000, 689000, 655000, 1150000, totalAssets];
   const cumNet = [0, 0, 50000, 50000, 50000, 150000, 150000, 150000, 150000];
   const returnCurve = months.map((month, i) => ({
     month,
@@ -421,6 +466,9 @@ function buildMockMetrics() {
     return_rate: round6((equities[i] - cumNet[i] - A0) / A0),
   }));
   const equityCurve = months.map((month, i) => ({ month, date: monthEnds[i], equity: equities[i] }));
+
+  // v2.3：按 1.4 口径从曲线生成翻倍/腰斩事件数组（[{date, return_rate}]）
+  const { doubleEvents, halvedEvents } = buildEventArrays(returnCurve);
 
   let peak = 0;
   let maxDrawdown = 0;
@@ -441,8 +489,10 @@ function buildMockMetrics() {
     profit_loss_ratio: round6(profitLossRatio),
     max_single_profit: round2(maxSingleProfit),
     max_single_loss: round2(maxSingleLoss),
-    double_count: 1,
-    halved_count: 0,
+    double_count: doubleEvents.length,
+    halved_count: halvedEvents.length,
+    double_events: doubleEvents,
+    halved_events: halvedEvents,
     unmatched_sell_amount: 0,
     monthly_pnl: monthlyPnl,
     equity_curve: equityCurve,

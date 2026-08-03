@@ -41,13 +41,14 @@ export default function KpiCards({ metrics }) {
       label: "账户翻倍次数",
       value: `${pnl.double_count ?? 0} 次`,
       sub: "累计收益率达到 +100% 的独立事件次数",
-      hl: (pnl.double_count || 0) > 0 ? "hl-accent" : "",
+      // v2.3：红涨绿跌——翻倍为涨方向（红），腰斩为跌方向（绿）
+      hl: (pnl.double_count || 0) > 0 ? "hl-up" : "",
     },
     {
       label: "账户腰斩次数",
       value: `${pnl.halved_count ?? 0} 次`,
       sub: "（1+R）自运行高点回撤 ≥ 50% 的独立事件次数",
-      hl: (pnl.halved_count || 0) > 0 ? "hl-danger" : "",
+      hl: (pnl.halved_count || 0) > 0 ? "hl-down" : "",
     },
     { label: "累计入金", value: fmtCny(account.gross_deposit) },
     { label: "累计出金", value: fmtCny(account.gross_withdraw) },

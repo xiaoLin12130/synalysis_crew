@@ -67,6 +67,15 @@ export function normalizeMetrics(raw = {}) {
       max_single_loss: n(pnl.max_single_loss),
       double_count: n(pnl.double_count),
       halved_count: n(pnl.halved_count),
+      // v2.3：翻倍/腰斩事件明细 [{date, return_rate}]，数据未就绪时为空数组（图表优雅降级）
+      double_events: arr(pnl.double_events).map((e) => ({
+        date: (e && e.date) || "",
+        return_rate: nullable(e && e.return_rate),
+      })),
+      halved_events: arr(pnl.halved_events).map((e) => ({
+        date: (e && e.date) || "",
+        return_rate: nullable(e && e.return_rate),
+      })),
       unmatched_sell_amount: nullable(pnl.unmatched_sell_amount),
       monthly_pnl: arr(pnl.monthly_pnl).map((p) => ({ month: (p && p.month) || "", pnl: n(p && p.pnl) })),
       equity_curve: arr(pnl.equity_curve).map((p) => ({ month: (p && p.month) || "", date: (p && p.date) || "", equity: n(p && p.equity) })),
@@ -108,14 +117,27 @@ export function normalizeMetrics(raw = {}) {
   };
 }
 
+// v2.3：8 档持仓周期（后端口径）
 const HOLDING_PERIOD_KEYS = [
-  { key: "le_1d", label: "≤1天" },
-  { key: "2_5d", label: "2–5天" },
-  { key: "6_20d", label: "6–20天" },
-  { key: "gt_20d", label: ">20天" },
+  { key: "d1", label: "1天" },
+  { key: "d2_3", label: "2-3天" },
+  { key: "d4_5", label: "4-5天" },
+  { key: "d6_10", label: "6-10天" },
+  { key: "d11_20", label: "11-20天" },
+  { key: "d21_30", label: "21-30天" },
+  { key: "d31_60", label: "31-60天" },
+  { key: "gt60", label: ">60天" },
 ];
 
-// S2：dict {le_1d, 2_5d, 6_20d, gt_20d} → [{label, count}]；兼容旧数组形态
+// v2.3 兼容：旧 4 档键 → 新 8 档近似映射（旧聚合无法拆分，按档位归并）
+const OLD_HOLDING_KEYS = {
+  le_1d: "d1",
+  "2_5d": "d2_3",
+  "6_20d": "d6_10",
+  gt_20d: "gt60",
+};
+
+// S2/v2.3：dict {d1,d2_3,...} → [{label, count}]；兼容旧 4 档与数组形态
 export function normalizeHoldingPeriodDistribution(raw) {
   if (!raw || typeof raw !== "object") return [];
   if (Array.isArray(raw)) {
@@ -123,6 +145,13 @@ export function normalizeHoldingPeriodDistribution(raw) {
       label: (b && (b.label || b.range)) || "",
       count: n(b && (b.count ?? b.value)),
     }));
+  }
+  const hasNew = HOLDING_PERIOD_KEYS.some(({ key }) => key in raw);
+  if (!hasNew && Object.keys(OLD_HOLDING_KEYS).some((k) => k in raw)) {
+    return HOLDING_PERIOD_KEYS.map(({ key, label }) => {
+      const oldKey = Object.keys(OLD_HOLDING_KEYS).find((k) => OLD_HOLDING_KEYS[k] === key);
+      return { label, count: oldKey ? n(raw[oldKey]) : 0 };
+    });
   }
   return HOLDING_PERIOD_KEYS.map(({ key, label }) => ({
     label,

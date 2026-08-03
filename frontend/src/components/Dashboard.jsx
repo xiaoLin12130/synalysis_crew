@@ -26,7 +26,10 @@ function Overview({ metrics }) {
           <p className="card-sub">
             时间加权 TWR（逐日模拟），Y 轴为百分比 · 最大回撤 {fmtPct(pnl.max_drawdown)}
           </p>
-          <ReturnCurveChart curve={pnl.return_curve} />
+          <ReturnCurveChart
+            curve={pnl.return_curve}
+            events={{ doubleEvents: pnl.double_events, halvedEvents: pnl.halved_events }}
+          />
         </div>
         <div className="card">
           <h3 className="card-title">月度盈亏</h3>

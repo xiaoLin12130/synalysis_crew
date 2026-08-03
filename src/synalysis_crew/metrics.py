@@ -34,7 +34,9 @@ v2 口径（与 requirements-v2.md 对齐）：
   账户会产生假阳性）；腰斩（v2.2 递进式）= floor 初始 1.0，遍历 v = 1 + R 曲线：
   v > floor → floor = v（新高重置）；v ≤ floor × 0.5 → 计 1 次且 floor = v
   （1→0.5 第 1 次、0.5→0.25 第 2 次、0.25→0.125 第 3 次，连续下跌逐级计数）；
-  回升超过当前 floor 才重置基线；
+  回升超过当前 floor 才重置基线；事件明细（v2.3）：
+  ``double_events / halved_events`` 记录每次触发日的 {date, return_rate}，
+  日期为逐日模拟中触发阈值的实际交易日，return_rate 为当日累计 R（小数）；
 - M6：首行「证券转银行」按其出金额计入现金流转（net_transfer/gross_withdraw/
   月转账），期初资金 = 余额 + 出金额；
 - 区间口径：期初资金 != 0 或期初有持仓（文件内先卖后买）时 ``is_partial=True``。
@@ -54,11 +56,13 @@ v2 口径（与 requirements-v2.md 对齐）：
                   avg_trade_amount, capital_turnover_rate, avg_holding_period_days},
       "pnl": {realized_pnl, win_count, loss_count, win_rate, total_profit, total_loss,
               profit_loss_ratio, max_single_profit, max_single_loss, double_count, halved_count,
-              unmatched_sell_amount, monthly_pnl[], equity_curve[], return_curve[], max_drawdown,
+              double_events[], halved_events[], unmatched_sell_amount, monthly_pnl[],
+              equity_curve[], return_curve[], max_drawdown,
               stock_leaderboard{top_profit[], top_loss[]}},
       "trades": [完整交易：买入→清仓闭环，{code, name, buy_qty, buy_amount, sell_qty,
                 sell_amount, pnl, holding_days, start_date, end_date, status}],
-      "behavior": {holding_period_distribution{}, monthly_activity[], max_position{},
+      "behavior": {holding_period_distribution{d1,d2_3,d4_5,d6_10,d11_20,d21_30,d31_60,gt60},
+                   monthly_activity[], max_position{},
                    top5_concentration, favorite_stocks_top10[], style{}, special_operations{}}
     }
 
@@ -71,10 +75,14 @@ v2 口径（与 requirements-v2.md 对齐）：
   (期末资产 − 累计入金) / 累计入金。
 - ``win_rate/盈亏比/持仓周期`` 均按**完整交易**统计，每闭环计一笔：
   周期盈亏 = 卖出净额 − 买入成本（含费用）；
+  ``holding_period_distribution`` 为 8 档（v2.3）{d1, d2_3, d4_5, d6_10, d11_20,
+  d21_30, d31_60, gt60}（1 / 2-3 / 4-5 / 6-10 / 11-20 / 21-30 / 31-60 / >60 天）；
 - ``double_count/halved_count`` 为**账户级**：按逐日 v = 1 + R 序列统计
   「R 从 < 100% 升到 ≥ 100% 的翻倍（v2.1）」与「递进式腰斩（v2.2：floor 初始
   1.0，v > floor → floor = v 新高重置；v ≤ floor × 0.5 → 计 1 次且 floor = v，
-  连续下跌逐级计数；回升超过当前 floor 才重置基线）」；
+  连续下跌逐级计数；回升超过当前 floor 才重置基线）」；对应事件明细
+  ``double_events / halved_events``（v2.3）= [{date, return_rate}]，日期为逐日
+  TWR 模拟触发阈值的实际交易日，``double_count/halved_count`` = 数组长度；
 - ``top_loss`` 按 total_pnl **升序**（亏损最多在前），``top_profit`` 降序；
 - 金额四舍五入到 2 位、比率到 4 位；非有限数输出 None，保证严格 JSON 序列化；
 - 无配对持仓的卖出（期初持仓）记入 ``unmatched_sell_amount``，不计入已实现盈亏与胜率。
@@ -248,6 +256,49 @@ def _count_halvings(vs: Sequence[float]) -> int:
             count += 1
             floor = v
     return count
+
+
+def _double_events(
+    dates: Sequence[date], vs: Sequence[float]
+) -> List[Dict[str, Any]]:
+    """v2.3 翻倍事件明细：v = 1+R 从 < 2.0 升到 ≥ 2.0 的独立事件。
+
+    返回 [{date: "YYYY-MM-DD", return_rate: 小数}]，日期为逐日 TWR 模拟中
+    触发阈值的实际交易日，return_rate 为触发日累计 R（v − 1，4 位舍入）。
+    """
+    events: List[Dict[str, Any]] = []
+    above_double = False
+    for d, v in zip(dates, vs):
+        if v >= 2.0:
+            if not above_double:
+                events.append(
+                    {"date": d.isoformat(), "return_rate": _round4(v - 1.0)}
+                )
+                above_double = True
+        else:
+            above_double = False
+    return events
+
+
+def _halved_events(
+    dates: Sequence[date], vs: Sequence[float]
+) -> List[Dict[str, Any]]:
+    """v2.3 腰斩事件明细（v2.2 递进式 floor 口径）。
+
+    返回 [{date: "YYYY-MM-DD", return_rate: 小数}]，日期为逐日 TWR 模拟中
+    触发阈值的实际交易日，return_rate 为触发日累计 R（v − 1，4 位舍入）。
+    """
+    events: List[Dict[str, Any]] = []
+    floor = 1.0
+    for d, v in zip(dates, vs):
+        if v > floor:
+            floor = v
+        elif v <= floor * 0.5:
+            events.append(
+                {"date": d.isoformat(), "return_rate": _round4(v - 1.0)}
+            )
+            floor = v
+    return events
 
 
 def _months_between(start: date, end: date) -> List[str]:
@@ -667,6 +718,8 @@ def _empty_result() -> MetricsResult:
                 "max_single_loss": 0.0,
                 "double_count": 0,
                 "halved_count": 0,
+                "double_events": [],
+                "halved_events": [],
                 "unmatched_sell_amount": 0.0,
                 "monthly_pnl": [],
                 "equity_curve": [],
@@ -676,10 +729,14 @@ def _empty_result() -> MetricsResult:
             },
             "behavior": {
                 "holding_period_distribution": {
-                    "le_1d": 0,
-                    "2_5d": 0,
-                    "6_20d": 0,
-                    "gt_20d": 0,
+                    "d1": 0,
+                    "d2_3": 0,
+                    "d4_5": 0,
+                    "d6_10": 0,
+                    "d11_20": 0,
+                    "d21_30": 0,
+                    "d31_60": 0,
+                    "gt60": 0,
                 },
                 "monthly_activity": [],
                 "max_position": {"ratio": 0.0, "code": None, "name": None, "date": None},
@@ -794,7 +851,16 @@ def compute_metrics(
     max_loss: Optional[float] = None
     unmatched_sell_amount = 0.0
 
-    dist = {"le_1d": 0, "2_5d": 0, "6_20d": 0, "gt_20d": 0}
+    dist = {
+        "d1": 0,
+        "d2_3": 0,
+        "d4_5": 0,
+        "d6_10": 0,
+        "d11_20": 0,
+        "d21_30": 0,
+        "d31_60": 0,
+        "gt60": 0,
+    }
     completed_trades: List[Dict[str, Any]] = []
     cycle_win_count = 0
     cycle_loss_count = 0
@@ -825,6 +891,7 @@ def compute_metrics(
     prev_day_end = opening_asset_value
     cum_v = 1.0
     daily_v: List[float] = []  # 每个有效交易日结算后的累计 (1 + R)
+    daily_dates: List[date] = []  # 与 daily_v 对齐：每个有效交易日的实际日期（v2.3 事件明细）
     day_R: Dict[date, Optional[float]] = {}  # 每个记录日结算后的累计 R（跳过日为 None）
 
     def finalize_twr_day() -> None:
@@ -854,6 +921,7 @@ def compute_metrics(
         day_R[current_day] = None if r_d is None else cum_v - 1.0
         if r_d is not None:
             daily_v.append(cum_v)
+            daily_dates.append(current_day)
 
     def update_max_pos(code: str, name: str, trade_date: date) -> None:
         nonlocal max_pos_ratio, max_pos_code, max_pos_name, max_pos_date
@@ -1043,13 +1111,21 @@ def compute_metrics(
                     cycle_hold_days_sum += hold_days
                     cycle_hold_count += 1
                     if hold_days <= 1:
-                        dist["le_1d"] += 1
+                        dist["d1"] += 1
+                    elif hold_days <= 3:
+                        dist["d2_3"] += 1
                     elif hold_days <= 5:
-                        dist["2_5d"] += 1
+                        dist["d4_5"] += 1
+                    elif hold_days <= 10:
+                        dist["d6_10"] += 1
                     elif hold_days <= 20:
-                        dist["6_20d"] += 1
+                        dist["d11_20"] += 1
+                    elif hold_days <= 30:
+                        dist["d21_30"] += 1
+                    elif hold_days <= 60:
+                        dist["d31_60"] += 1
                     else:
-                        dist["gt_20d"] += 1
+                        dist["gt60"] += 1
                     if cycle_pnl > _EPS:
                         cycle_win_count += 1
                         cycle_total_profit += cycle_pnl
@@ -1185,14 +1261,18 @@ def compute_metrics(
             peak_v = v
         max_drawdown = max(max_drawdown, (peak_v - v) / peak_v)
 
-    # ---- 账户级翻倍 / 腰斩（1.4）：逐日 v = 1 + R 序列 ----
+    # ---- 账户级翻倍 / 腰斩（1.4 v2.2/v2.3）：逐日 v = 1 + R 序列 ----
     # 翻倍（v2.1 不变）：累计 R 从 < 100% 升到 ≥ 100% 计 1 次独立事件
     #（禁止「从运行低点翻倍」——接近归零的账户会产生假阳性）；
     # 腰斩（v2.2 递进式）：floor 初始 1.0，v > floor → floor = v（新高重置），
     # v ≤ floor × 0.5 → 计 1 次且 floor = v（连续下跌逐级计数），
-    # 回升超过当前 floor 才重置基线。
-    double_count = _count_doublings(daily_v)
-    halved_count = _count_halvings(daily_v)
+    # 回升超过当前 floor 才重置基线；
+    # 事件明细（v2.3）：double_events/halved_events 记录触发日的实际交易日
+    # 与当日累计 R，double_count/halved_count = 数组长度。
+    double_events = _double_events(daily_dates, daily_v)
+    halved_events = _halved_events(daily_dates, daily_v)
+    double_count = len(double_events)
+    halved_count = len(halved_events)
 
     # ---- v2.1 收益率：主口径 = 逐日 TWR 最终 R ----
     total_return_rate = None if not daily_v else cum_v - 1.0
@@ -1422,6 +1502,8 @@ def compute_metrics(
                 "max_single_loss": _round2(max_loss) if max_loss is not None else 0.0,
                 "double_count": double_count,
                 "halved_count": halved_count,
+                "double_events": double_events,
+                "halved_events": halved_events,
                 "unmatched_sell_amount": _round2(unmatched_sell_amount),
                 "monthly_pnl": monthly_pnl,
                 "equity_curve": equity_curve,

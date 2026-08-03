@@ -11,6 +11,8 @@
   return_curve 每月末累计 R（无记录月份沿用上一值补齐）；
 - 最大回撤基于逐日 (1+R) 序列；账户级翻倍（v2.1：R ≥ +100% 独立事件）/腰斩
   （v2.2 递进式：floor 初始 1.0，新高重置，v ≤ floor×0.5 逐级计数）；
+  事件明细 double_events/halved_events（v2.3：触发日日期 + 当日累计 R）；
+- 持仓周期分布 8 档（v2.3）：{d1, d2_3, d4_5, d6_10, d11_20, d21_30, d31_60, gt60}；
 - 亏损榜 top_loss 升序（亏损最多在前）、top_profit 降序；
 - akshare 最新价成功 / 失败按成本兜底（monkeypatch，不发网络请求）；
 - 固定 JSON Schema（全英文 snake_case、可严格 JSON 序列化），_empty_result 含
@@ -294,10 +296,14 @@ def test_full_history_hand_check_pnl_behavior_and_trades(no_price_fetch):
     # D 行为画像（持仓周期按完整交易：A 2 / B 3 / C 8 / D 15 / E 20 / F 36 天）
     b = m["behavior"]
     assert b["holding_period_distribution"] == {
-        "le_1d": 0,
-        "2_5d": 2,
-        "6_20d": 3,
-        "gt_20d": 1,
+        "d1": 0,
+        "d2_3": 2,
+        "d4_5": 0,
+        "d6_10": 1,
+        "d11_20": 2,
+        "d21_30": 0,
+        "d31_60": 1,
+        "gt60": 0,
     }
     assert b["monthly_activity"] == [
         {"month": "2024-01", "total_count": 6, "buy_count": 3, "sell_count": 3},
@@ -363,10 +369,14 @@ def test_fifo_fees_in_cost_and_net_proceeds(no_price_fetch):
     ]
     assert m["trading"]["avg_holding_period_days"] == pytest.approx(9.0, abs=0.01)
     assert m["behavior"]["holding_period_distribution"] == {
-        "le_1d": 0,
-        "2_5d": 0,
-        "6_20d": 1,
-        "gt_20d": 0,
+        "d1": 0,
+        "d2_3": 0,
+        "d4_5": 0,
+        "d6_10": 1,
+        "d11_20": 0,
+        "d21_30": 0,
+        "d31_60": 0,
+        "gt60": 0,
     }
     # 账户级 v = 1.0765，无翻倍/腰斩
     assert m["pnl"]["double_count"] == 0
@@ -392,7 +402,8 @@ def test_fifo_partial_sell_no_completed_trade(no_price_fetch):
     assert m["pnl"]["win_rate"] is None
     assert m["trading"]["avg_holding_period_days"] is None
     assert m["behavior"]["holding_period_distribution"] == {
-        "le_1d": 0, "2_5d": 0, "6_20d": 0, "gt_20d": 0,
+        "d1": 0, "d2_3": 0, "d4_5": 0, "d6_10": 0,
+        "d11_20": 0, "d21_30": 0, "d31_60": 0, "gt60": 0,
     }
 
 
@@ -564,7 +575,7 @@ def test_bonus_share_dilutes_cost_and_trade_uses_buy_qty_only(no_price_fetch):
             "status": "closed",
         }
     ]
-    assert m["behavior"]["holding_period_distribution"]["gt_20d"] == 1
+    assert m["behavior"]["holding_period_distribution"]["gt60"] == 1
     assert m["behavior"]["special_operations"]["bonus_share"] == {
         "count": 1, "qty": 50.0,
     }
@@ -610,7 +621,7 @@ def test_multi_cycle_closed_trades(no_price_fetch):
     assert m["pnl"]["win_rate"] == pytest.approx(1.0, abs=1e-4)
     assert m["pnl"]["double_count"] == 0
     assert m["pnl"]["halved_count"] == 0
-    assert m["behavior"]["holding_period_distribution"]["2_5d"] == 2
+    assert m["behavior"]["holding_period_distribution"]["d2_3"] == 2
     assert m["trading"]["avg_holding_period_days"] == pytest.approx(2.0, abs=0.01)
 
 
@@ -821,6 +832,13 @@ def test_twr_double_and_halved_events(no_price_fetch):
     m = compute_metrics(trades)
     assert m["pnl"]["double_count"] == 2
     assert m["pnl"]["halved_count"] == 1
+    assert m["pnl"]["double_events"] == [
+        {"date": "2024-01-04", "return_rate": 1.0},
+        {"date": "2024-01-08", "return_rate": 1.55},
+    ]
+    assert m["pnl"]["halved_events"] == [
+        {"date": "2024-01-10", "return_rate": 0.05},
+    ]
     assert m["account"]["total_return_rate"] == pytest.approx(0.1, abs=1e-6)
     assert m["pnl"]["max_drawdown"] == pytest.approx((2.55 - 1.05) / 2.55, abs=1e-4)
     assert m["pnl"]["return_curve"] == [
@@ -865,6 +883,28 @@ def test_count_halvings_flat_and_equal_boundaries():
     assert metrics_module._count_halvings([]) == 0
 
 
+def test_double_halved_events_hand_sequences():
+    """v2.3 事件明细：日期取触发阈值的实际交易日，return_rate 为当日累计 R。"""
+    dates = [date(2024, 1, d) for d in (2, 3, 4, 5, 6, 7)]
+    vs = [1.0, 0.5, 0.25, 0.125, 2.0, 1.0]
+    assert metrics_module._halved_events(dates, vs) == [
+        {"date": "2024-01-03", "return_rate": -0.5},
+        {"date": "2024-01-04", "return_rate": -0.75},
+        {"date": "2024-01-05", "return_rate": -0.875},
+        {"date": "2024-01-07", "return_rate": 0.0},
+    ]
+    assert metrics_module._double_events(dates, vs) == [
+        {"date": "2024-01-06", "return_rate": 1.0},
+    ]
+    # count 与事件数组长度一致
+    assert metrics_module._count_halvings(vs) == len(
+        metrics_module._halved_events(dates, vs)
+    )
+    assert metrics_module._count_doublings(vs) == len(
+        metrics_module._double_events(dates, vs)
+    )
+
+
 def test_twr_halved_progressive_consecutive_decline_v22(no_price_fetch):
     """v2.2 1.4 端到端（真实交易序列）：连续下跌逐级计数 + 回升新高重置 + 再腰斩。
 
@@ -895,6 +935,16 @@ def test_twr_halved_progressive_consecutive_decline_v22(no_price_fetch):
     m = compute_metrics(trades)
     assert m["pnl"]["double_count"] == 1
     assert m["pnl"]["halved_count"] == 5
+    assert m["pnl"]["double_events"] == [
+        {"date": "2024-01-12", "return_rate": 2.0},
+    ]
+    assert m["pnl"]["halved_events"] == [
+        {"date": "2024-01-04", "return_rate": -0.5},
+        {"date": "2024-01-08", "return_rate": -0.75},
+        {"date": "2024-01-10", "return_rate": -0.875},
+        {"date": "2024-01-16", "return_rate": 0.5},
+        {"date": "2024-01-22", "return_rate": -0.28},
+    ]
     assert m["account"]["total_return_rate"] == pytest.approx(0.72 - 1, abs=1e-6)
     assert m["pnl"]["max_drawdown"] == pytest.approx((1.0 - 0.125) / 1.0, abs=1e-6)
     assert m["pnl"]["return_curve"] == [
@@ -1075,6 +1125,12 @@ def test_empty_result_has_v2_fields():
     assert m["pnl"]["monthly_pnl"] == []
     assert m["pnl"]["equity_curve"] == []
     assert m["pnl"]["return_curve"] == []
+    assert m["pnl"]["double_events"] == []
+    assert m["pnl"]["halved_events"] == []
+    assert m["behavior"]["holding_period_distribution"] == {
+        "d1": 0, "d2_3": 0, "d4_5": 0, "d6_10": 0,
+        "d11_20": 0, "d21_30": 0, "d31_60": 0, "gt60": 0,
+    }
     assert m["trades"] == []
     assert m["stocks"] == []
     assert m["pnl"]["stock_leaderboard"] == {"top_profit": [], "top_loss": []}
