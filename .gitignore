@@ -3,6 +3,7 @@ data/*.xlsx
 data/*.xls
 data/*.csv
 data/analyses/
+data/code_names.json
 
 # 环境变量与密钥
 .env

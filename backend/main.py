@@ -36,6 +36,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from synalysis_crew.graph import analyze  # noqa: E402
 from synalysis_crew.metrics import compute_metrics  # noqa: E402
+from synalysis_crew.name_service import enrich_names  # noqa: E402
 from synalysis_crew.parser import ParseError, parse_trades  # noqa: E402
 from synalysis_crew.storage import (  # noqa: E402
     delete_analysis,
@@ -133,6 +134,13 @@ def _run_job(job_id: str, path: Path, filename: str) -> None:
     try:
         _update(job_id, status="running", stage="parsing", pct=2, message="解析交割单…")
         trades = parse_trades(str(path))
+        _update(job_id, stage="parsing", pct=4, message="补充股票名称…")
+        try:
+            # 涨乐交割单无证券名称列：按代码补名（A股 + ETF 全市场，缓存 7 天）；
+            # 拉取失败/超时自动回退，绝不阻塞分析主流程。
+            enrich_names(trades)
+        except Exception:  # noqa: BLE001
+            pass
         _update(
             job_id,
             stage="metrics",

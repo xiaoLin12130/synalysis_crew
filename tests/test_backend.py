@@ -98,6 +98,12 @@ def no_price_fetch(monkeypatch):
     )
 
 
+@pytest.fixture()
+def no_name_enrich(monkeypatch):
+    """禁用股票名称补充：名称映射拉取离线禁用，保证测试确定性与速度。"""
+    monkeypatch.setattr(main, "enrich_names", lambda trades: 0)
+
+
 # ---------------------------------------------------------------------------
 # 健康检查
 # ---------------------------------------------------------------------------
@@ -114,7 +120,9 @@ def test_health(client):
 # ---------------------------------------------------------------------------
 
 
-def test_upload_poll_done_history_detail(client, iso_dir, no_price_fetch):
+def test_upload_poll_done_history_detail(
+    client, iso_dir, no_price_fetch, no_name_enrich
+):
     xlsx = build_xlsx(iso_dir / "synthetic.xlsx")
     resp = client.post(
         "/api/analyze",
@@ -320,7 +328,9 @@ def test_delete_analysis_isolated_from_repo_data(client, iso_dir):
 # ---------------------------------------------------------------------------
 
 
-def test_public_mode_analysis_no_record(client, iso_dir, no_price_fetch, monkeypatch):
+def test_public_mode_analysis_no_record(
+    client, iso_dir, no_price_fetch, no_name_enrich, monkeypatch
+):
     """公网无历史模式：分析照常完成，但不落盘（record_id=null），历史列表恒空。"""
     monkeypatch.setenv("SYNALYSIS_PUBLIC_MODE", "1")
     xlsx = build_xlsx(iso_dir / "public.xlsx")
@@ -353,6 +363,40 @@ def test_public_mode_analysis_no_record(client, iso_dir, no_price_fetch, monkeyp
     assert not (iso_dir / "analyses").exists() or not any(
         (iso_dir / "analyses").iterdir()
     )
+
+
+# ---------------------------------------------------------------------------
+# 股票名称补充（N1）：enrich 失败不阻塞分析流程
+# ---------------------------------------------------------------------------
+
+
+def test_job_still_done_when_enrich_names_raises(
+    client, iso_dir, no_price_fetch, monkeypatch
+):
+    """enrich_names 抛异常 -> try/except 吞掉，任务继续 compute_metrics -> done。"""
+
+    def boom(trades):
+        raise RuntimeError("名称服务不可用")
+
+    monkeypatch.setattr(main, "enrich_names", boom)
+    xlsx = build_xlsx(iso_dir / "enrich_fail.xlsx")
+    resp = client.post(
+        "/api/analyze",
+        files={
+            "file": (
+                "enrich_fail.xlsx",
+                xlsx.read_bytes(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    job = _poll_job(client, resp.json()["job_id"])
+    assert job["status"] == "done"
+    assert job["pct"] == 100
+    assert job["result"] is not None
+    assert job["result"]["analysis"]["final_report"]
 
 
 # ---------------------------------------------------------------------------

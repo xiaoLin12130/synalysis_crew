@@ -54,6 +54,12 @@
 |---|---|---|---|
 | 外部项目改了共享技能目录 | 分析师数量从 5 变 7，测试失败 | synalysis 复用 `H:\stock_review_crew\skills`，该目录被复盘项目新增 host/review_assistant | 本系统固定只加载 SKILL_ID_ORDER 的 5 位分析师（analyst.py），外部新增技能一律忽略；不要依赖外部目录内容不变 |
 
+## 5.2 股票名称补充（name_service）
+| 问题 | 现象 | 原因 | 解决 |
+|---|---|---|---|
+| 涨乐交割单无证券名称 | 表格/AI 报告只有代码 | 券商导出格式差异 | akshare 全市场（A股+ETF）拉取 + `data/code_names.json` 缓存（TTL 7 天，gitignored）；失败回退旧缓存/空映射，绝不阻塞分析 |
+| 首次建缓存拉取失败 | enrich 静默返回空 | 沙箱无网络 | 首次 `get_code_name_map()` 需提权联网；akshare 会向 stdout 打 tqdm 进度条噪音（服务端日志可见，不影响功能） |
+
 ## 6. 部署（Cloudflare Tunnel）
 - cloudflared 下载：GitHub releases（走代理 127.0.0.1:7890），放 `.tmp\cloudflared.exe`。
 - 快速隧道：`cloudflared tunnel --url http://127.0.0.1:8501 --no-autoupdate`，公网地址从 stdout/stderr 日志解析 `https://*.trycloudflare.com`；一键脚本 `scripts\start_tunnel.ps1`。
