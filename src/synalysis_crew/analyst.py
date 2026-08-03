@@ -273,9 +273,9 @@ def load_skills() -> list[dict]:
         fallback = next((s for s in FALLBACK_SKILLS if s["id"] == sid), None)
         if fallback:
             result.append(dict(fallback))
-    for s in loaded:  # 目录里的额外 Skill 追加在后
-        if s["id"] not in SKILL_ID_ORDER and s not in result:
-            result.append(s)
+    # 固定只使用 SKILL_ID_ORDER 的 5 位分析师：外部目录（stock_review_crew/skills）
+    # 可能被其他项目新增技能（如 host/review_assistant），本系统契约恒为 5 位，
+    # 额外技能一律忽略，保证分析口径与测试稳定。
     return result
 
 

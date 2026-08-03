@@ -10,8 +10,8 @@ export default function UploadView({ onUpload, busy }) {
     setError("");
     if (!f) return;
     const name = f.name || "";
-    if (!/\.(xlsx|xls)$/i.test(name)) {
-      setError("文件格式不支持：请选择券商导出的 .xlsx 交割单文件");
+    if (!/\.(xlsx|xls|csv|txt)$/i.test(name)) {
+      setError("文件格式不支持：请选择券商导出的交割单（.xlsx / .xls / .csv / .txt）");
       setFile(null);
       return;
     }
@@ -50,14 +50,14 @@ export default function UploadView({ onUpload, busy }) {
         <div className="dz-icon">📊</div>
         <div className="dz-title">{file ? "已选择文件，点击可重新选择" : "点击选择或拖拽交割单到此处"}</div>
         <div className="dz-sub">
-          支持券商导出的 Excel 交割单（.xlsx / .xls）
+          支持同花顺导出的交割单（.xlsx / .xls / .csv / .txt）
           <br />
           文件仅用于本次分析，不保存原始数据
         </div>
         <input
           ref={inputRef}
           type="file"
-          accept=".xlsx,.xls"
+          accept=".xlsx,.xls,.csv,.txt"
           style={{ display: "none" }}
           onChange={(e) => {
             const f = e.target.files && e.target.files[0];

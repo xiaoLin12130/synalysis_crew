@@ -49,6 +49,11 @@
 - 模块负责人登记表在 `docs/PROGRESS.md`；进度估算脚本 `scripts/progress.py`。
 - 测试隔离：`SYNALYSIS_DATA_DIR` 指向 `.tmp/`，不要写仓库 `data/analyses/`。
 
+## 5.1 外部依赖变更防护
+| 问题 | 现象 | 原因 | 解决 |
+|---|---|---|---|
+| 外部项目改了共享技能目录 | 分析师数量从 5 变 7，测试失败 | synalysis 复用 `H:\stock_review_crew\skills`，该目录被复盘项目新增 host/review_assistant | 本系统固定只加载 SKILL_ID_ORDER 的 5 位分析师（analyst.py），外部新增技能一律忽略；不要依赖外部目录内容不变 |
+
 ## 6. 部署（Cloudflare Tunnel）
 - cloudflared 下载：GitHub releases（走代理 127.0.0.1:7890），放 `.tmp\cloudflared.exe`。
 - 快速隧道：`cloudflared tunnel --url http://127.0.0.1:8501 --no-autoupdate`，公网地址从 stdout/stderr 日志解析 `https://*.trycloudflare.com`；一键脚本 `scripts\start_tunnel.ps1`。

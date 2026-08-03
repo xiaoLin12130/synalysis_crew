@@ -2,7 +2,9 @@
 
 覆盖：10 种操作类型、中途开始场景、列序/表头空格/标题行容忍、
 费用聚合、UNKNOWN 兜底、空行跳过、0 金额保留、日期多格式、
-CSV 编码、xls 尽力而为、中文错误信息、合同号脱敏。
+CSV/TXT 分隔符探测（逗号/制表符/分号/空格）与编码链（utf-8-sig/gb18030/gbk）、
+涨乐财富通版式（摘要映射/数量符号/费用映射/cash_amount/无名称列）、
+xls 尽力而为、中文错误信息、合同号脱敏。
 """
 
 from __future__ import annotations
@@ -24,7 +26,15 @@ for _path in (_SRC, _FIXTURES):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from synthetic_trades import STANDARD_HEADERS, build_xlsx, make_trades  # noqa: E402
+from synthetic_trades import (  # noqa: E402
+    STANDARD_HEADERS,
+    build_csv,
+    build_txt,
+    build_xlsx,
+    build_zhangle_csv,
+    make_trades,
+    make_zhangle_trades,
+)
 from synalysis_crew import OP_LABELS, OpType, ParseError, TradeRecord, parse_trades  # noqa: E402
 
 
@@ -75,6 +85,26 @@ def _write_workbook(
     return path
 
 
+def _assert_trades_equal(got: list[TradeRecord], expected: list[TradeRecord]) -> None:
+    assert len(got) == len(expected)
+    for actual, exp in zip(got, expected):
+        assert actual.code == exp.code
+        assert actual.name == exp.name
+        assert actual.op_type is exp.op_type
+        assert actual.trade_date == exp.trade_date
+        assert actual.currency == exp.currency
+        assert actual.contract_no == exp.contract_no
+        assert actual.qty == pytest.approx(exp.qty)
+        assert actual.price == pytest.approx(exp.price)
+        assert actual.amount == pytest.approx(exp.amount)
+        assert actual.balance == pytest.approx(exp.balance)
+        assert actual.cash_amount == pytest.approx(exp.cash_amount)
+        assert actual.fee == pytest.approx(exp.fee)
+        assert actual.stamp_tax == pytest.approx(exp.stamp_tax)
+        assert actual.commission == pytest.approx(exp.commission)
+        assert actual.transfer_fee == pytest.approx(exp.transfer_fee)
+
+
 # ---------------------------------------------------------------------------
 # 合成夹具
 # ---------------------------------------------------------------------------
@@ -119,24 +149,8 @@ def test_make_trades_unknown_optional():
 def test_parse_synthetic_xlsx_roundtrip(tmp_path):
     path = build_xlsx(tmp_path / "synthetic.xlsx")
     trades = parse_trades(path)
-    expected = make_trades()
-    assert len(trades) == len(expected)
+    _assert_trades_equal(trades, make_trades())
     assert {t.op_type for t in trades} == REAL_TEN_OPS
-    for got, exp in zip(trades, expected):
-        assert got.code == exp.code
-        assert got.name == exp.name
-        assert got.op_type is exp.op_type
-        assert got.trade_date == exp.trade_date
-        assert got.currency == exp.currency
-        assert got.contract_no == exp.contract_no
-        assert got.qty == pytest.approx(exp.qty)
-        assert got.price == pytest.approx(exp.price)
-        assert got.amount == pytest.approx(exp.amount)
-        assert got.balance == pytest.approx(exp.balance)
-        assert got.fee == pytest.approx(exp.fee)
-        assert got.stamp_tax == pytest.approx(exp.stamp_tax)
-        assert got.commission == pytest.approx(exp.commission)
-        assert got.transfer_fee == pytest.approx(exp.transfer_fee)
 
 
 def test_parse_shuffled_columns_with_spaces_and_title(tmp_path):
@@ -370,6 +384,143 @@ def test_parse_csv_utf8_sig_and_gbk(tmp_path):
         assert trade.trade_date == date(2025, 11, 27)
         assert trade.amount == pytest.approx(1050.0)  # "1,050.00" 千分位
         assert trade.balance == pytest.approx(4945.0)
+
+
+def test_parse_csv_tab_delimited(tmp_path):
+    path = build_csv(tmp_path / "tab_delimited.csv", delimiter="\t")
+    trades = parse_trades(path)
+    _assert_trades_equal(trades, make_trades())
+
+
+def test_parse_csv_semicolon_delimited(tmp_path):
+    path = build_csv(tmp_path / "semicolon.csv", delimiter=";")
+    trades = parse_trades(path)
+    assert len(trades) == len(make_trades())
+    assert trades[0].op_type is OpType.SELL
+    assert trades[0].code == "600519"
+    assert trades[0].balance == pytest.approx(149818.50)
+
+
+def test_parse_csv_gbk_tab_delimited(tmp_path):
+    """GBK 编码 + 制表符分隔：编码链与分隔符探测同时覆盖。"""
+    path = build_csv(tmp_path / "gbk_tab.csv", encoding="gbk", delimiter="\t")
+    trades = parse_trades(path)
+    assert len(trades) == len(make_trades())
+    assert trades[0].name == "贵州茅台"
+    assert trades[0].trade_date == date(2025, 11, 27)
+
+
+def test_parse_txt_tab_delimited(tmp_path):
+    path = build_txt(tmp_path / "tab.txt", delimiter="\t")
+    trades = parse_trades(path)
+    _assert_trades_equal(trades, make_trades())
+
+
+def test_parse_txt_space_delimited(tmp_path):
+    """空格分隔：含空字段行（银行转证券等）也能无损还原。"""
+    path = build_txt(tmp_path / "space.txt", delimiter=" ")
+    trades = parse_trades(path)
+    _assert_trades_equal(trades, make_trades())
+
+
+def test_parse_txt_gbk_space_delimited(tmp_path):
+    path = build_txt(tmp_path / "gbk_space.txt", encoding="gbk", delimiter=" ")
+    trades = parse_trades(path)
+    assert len(trades) == len(make_trades())
+    assert trades[1].op_type is OpType.BANK_TO_SEC  # 空代码/空名称行
+    assert trades[1].balance == pytest.approx(199818.50)
+
+
+def test_parse_txt_unknown_delimiter_raises(tmp_path):
+    path = tmp_path / "unknown.txt"
+    path.write_text("这是一行没有分隔符的内容\n第二行也没有分隔符\n", encoding="utf-8")
+    with pytest.raises(ParseError) as excinfo:
+        parse_trades(path)
+    assert "分隔符" in str(excinfo.value)
+
+
+def test_parse_text_undecodable_raises(tmp_path):
+    path = tmp_path / "bad.txt"
+    path.write_bytes(b"\xff\xff\xff\xff")  # utf-8 与 gb18030 均无法解码
+    with pytest.raises(ParseError) as excinfo:
+        parse_trades(path)
+    assert "编码" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# 涨乐财富通版式
+# ---------------------------------------------------------------------------
+
+
+def test_make_zhangle_trades_layout():
+    trades = make_zhangle_trades()
+    assert {t.op_type for t in trades} == REAL_TEN_OPS
+    # 涨乐无证券名称/资金余额/币种/佣金列
+    assert all(t.name == "" for t in trades)
+    assert all(t.balance == 0.0 for t in trades)
+    assert all(t.currency == "" for t in trades)
+    assert all(t.commission == 0.0 for t in trades)
+    # cash_amount 带符号：买入为负、卖出为正
+    buy = next(t for t in trades if t.op_type is OpType.BUY)
+    sell = next(t for t in trades if t.op_type is OpType.SELL)
+    assert buy.cash_amount < 0
+    assert sell.cash_amount > 0
+
+
+def test_parse_zhangle_csv_roundtrip(tmp_path):
+    path = build_zhangle_csv(tmp_path / "zhangle.csv")
+    trades = parse_trades(path)
+    _assert_trades_equal(trades, make_zhangle_trades())
+    assert {t.op_type for t in trades} == REAL_TEN_OPS
+    assert all(t.name == "" and t.balance == 0.0 and t.currency == "" for t in trades)
+
+
+def test_parse_zhangle_qty_sign_trusts_summary(tmp_path):
+    """数量符号与摘要不一致时以摘要为准，数量取绝对值；费用/现金流水映射。"""
+    path = tmp_path / "zhangle_raw.csv"
+    path.write_bytes(
+        (
+            "日期,摘要,发生金额,委托号,过户费,其他杂费,手续费/佣金,印花税,"
+            "成交金额,股票代码,成交数量,成交价格\n"
+            # 摘要=证券买入 但数量为负（不一致）-> 仍按 BUY，数量取 abs
+            "20260630,证券买入,-2541.53,144152,0.03,0.50,5.00,0.00,"
+            "2536.00,000630,-400.00,6.340\n"
+            # 摘要=证券卖出 但数量为正（不一致）-> 仍按 SELL，数量取 abs
+            "20260630,证券卖出,2569.63,115458,0.00,0.00,0.77,0.00,"
+            "2570.40,159559,1800.00,1.428\n"
+        ).encode("utf-8")
+    )
+    trades = parse_trades(path)
+    assert len(trades) == 2
+    buy, sell = trades
+    assert buy.op_type is OpType.BUY
+    assert buy.qty == pytest.approx(400.0)
+    assert sell.op_type is OpType.SELL
+    assert sell.qty == pytest.approx(1800.0)
+    # 涨乐列 -> 标准字段映射
+    assert buy.code == "000630"
+    assert buy.name == ""
+    assert buy.trade_date == date(2026, 6, 30)
+    assert buy.amount == pytest.approx(2536.0)
+    assert buy.price == pytest.approx(6.34)
+    assert buy.fee == pytest.approx(5.5)  # 手续费/佣金 5.00 + 其他杂费 0.50
+    assert buy.stamp_tax == pytest.approx(0.0)
+    assert buy.transfer_fee == pytest.approx(0.03)  # 过户费
+    assert buy.cash_amount == pytest.approx(-2541.53)  # 发生金额（带符号）
+    assert buy.balance == 0.0  # 无资金余额列
+    assert buy.contract_no == "144152"  # 委托号
+    assert buy.to_dict()["contract_no"] == "**4152"  # 序列化脱敏
+    assert sell.cash_amount == pytest.approx(2569.63)
+    assert sell.fee == pytest.approx(0.77)
+
+
+def test_parse_zhangle_gbk_encoding(tmp_path):
+    path = build_zhangle_csv(tmp_path / "zhangle_gbk.csv", encoding="gbk")
+    trades = parse_trades(path)
+    assert len(trades) == len(make_zhangle_trades())
+    assert trades[0].code == "600519"
+    assert trades[0].op_type is OpType.SELL
+    assert trades[0].cash_amount == pytest.approx(149818.50)
 
 
 # ---------------------------------------------------------------------------

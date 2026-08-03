@@ -1,25 +1,34 @@
-"""同花顺交割单解析器（Issue #1）。
+"""交割单解析器（Issue #1，券商无关）。
 
 职责：
-- 读取同花顺导出的交割单（.xlsx 为主，.xls/.csv 尽力而为）；
-- 自动识别表头（容忍列序变化、表头前后空格、全角括号、标题行）；
+- 读取多家券商导出的交割单：同花顺、涨乐财富通（华泰）等，.xlsx 为主，
+  .xls/.csv/.txt 尽力而为；
+- 文本类文件（.csv/.txt）自动探测分隔符（逗号/制表符/分号/空格）与编码
+  （utf-8-sig → gb18030 → gbk），列名自动识别与 xlsx 路径一致；
+- 券商无关表头映射层：维护「列名同义词表 → 标准字段」，同花顺列与涨乐列
+  统一走同一张表；自动识别表头（容忍列序变化、表头前后空格、全角括号、标题行）；
 - 操作类型归一化为 ``OpType`` 枚举，未知操作归 ``UNKNOWN`` 不报错；
 - 脏数据容错：空行/无操作行跳过，金额为 0 保留，日期兼容 int/datetime/str；
-- 文件不存在或不可解析时抛出带中文信息的 ``ParseError``。
+- 数量带符号的来源（涨乐：买正卖负）一律取绝对值，方向以「摘要/操作」列为准；
+- 文件不存在、不可解析、分隔符/编码无法识别时抛出带中文信息的 ``ParseError``。
 
 字段口径（契约见 docs/requirements.md 第 4 章）：
-- ``fee``          = 同花顺「手续费」+「其他杂费」（TradeRecord 无独立杂费字段，
-  合并进 fee，保证下游「总交易成本 = 手续费+印花税+佣金+过户费+杂费」口径成立）；
+- ``fee``          = 同花顺「手续费」+「其他杂费」，或涨乐「手续费/佣金」+「其他杂费」；
 - ``transfer_fee`` = 「过户费」+「清算费(B股)」；
+- ``cash_amount``   = 「发生金额」（带符号现金流）；仅涨乐版式（无「资金余额」列）
+  填充，同花顺版式不填（保持 0.0，金额口径由资金余额序列推算）；
 - ``contract_no``  在 ``to_dict()`` 中脱敏（保留末 4 位），dataclass 属性保留原始值
   仅供本地处理，任何输出/序列化一律走 ``to_dict()``。
 """
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
+import io
 import math
 import os
+import re
 from dataclasses import dataclass
 from enum import Enum
 from numbers import Integral, Real
@@ -68,6 +77,7 @@ class TradeRecord:
     price: float = 0.0
     amount: float = 0.0
     balance: float = 0.0
+    cash_amount: float = 0.0
     fee: float = 0.0
     stamp_tax: float = 0.0
     commission: float = 0.0
@@ -86,6 +96,7 @@ class TradeRecord:
             "price": self.price,
             "amount": self.amount,
             "balance": self.balance,
+            "cash_amount": self.cash_amount,
             "fee": self.fee,
             "stamp_tax": self.stamp_tax,
             "commission": self.commission,
@@ -97,29 +108,30 @@ class TradeRecord:
 
 
 # ---------------------------------------------------------------------------
-# 表头识别
+# 券商无关表头映射层：列名同义词表 -> 标准字段
+# （同花顺 / 涨乐财富通等统一走该表；注释标注来源，未标注者两券商通用）
 # ---------------------------------------------------------------------------
 
 _COLUMN_ALIASES: dict[str, list[str]] = {
-    "code": ["证券代码", "股票代码", "代码"],
-    "name": ["证券名称", "证券简称", "股票名称", "名称"],
-    "op": ["操作", "交易操作", "业务类型"],
-    "qty": ["成交数量", "成交量", "成交股数"],
-    "price": ["成交均价", "成交价", "均价"],
-    "amount": ["成交金额", "成交额"],
-    "stock_balance": ["股票余额", "证券余额", "持仓余额"],  # 识别但不在契约字段中
-    "cash_amount": ["发生金额"],  # 识别但不在契约字段中
-    "fee": ["手续费"],
-    "stamp_tax": ["印花税"],
-    "misc_fee": ["其他杂费", "其它杂费"],
-    "balance": ["资金余额", "现金余额", "余额"],
-    "contract_no": ["合同编号", "合同号", "合同序号"],
-    "trade_date": ["交收日期", "成交日期", "交易日期", "日期"],
-    "full_name": ["证券中文全称", "证券全称"],
-    "commission": ["佣金"],
-    "transfer_fee": ["过户费"],
-    "settlement_fee": ["清算费(b股)", "清算费", "b股清算费"],
-    "currency": ["币种", "货币"],
+    "code": ["证券代码", "股票代码", "代码"],  # 同花顺 / 涨乐
+    "name": ["证券名称", "证券简称", "股票名称", "名称"],  # 同花顺（涨乐无名称列 -> 置空）
+    "op": ["操作", "交易操作", "业务类型", "摘要"],  # 摘要：涨乐
+    "qty": ["成交数量", "成交量", "成交股数"],  # 涨乐数量带符号（买正卖负），解析时取 abs
+    "price": ["成交均价", "成交价", "均价", "成交价格"],  # 成交价格：涨乐
+    "amount": ["成交金额", "成交额"],  # 同花顺 / 涨乐
+    "stock_balance": ["股票余额", "证券余额", "持仓余额"],  # 识别但不在契约字段中（同花顺）
+    "cash_amount": ["发生金额"],  # 同花顺 / 涨乐；仅涨乐版式（无资金余额列）填充
+    "fee": ["手续费", "手续费/佣金"],  # 手续费/佣金：涨乐合并列
+    "stamp_tax": ["印花税"],  # 同花顺 / 涨乐
+    "misc_fee": ["其他杂费", "其它杂费"],  # 同花顺 / 涨乐
+    "balance": ["资金余额", "现金余额", "余额"],  # 同花顺（涨乐无资金余额列 -> 0.0）
+    "contract_no": ["合同编号", "合同号", "合同序号", "委托号"],  # 委托号：涨乐
+    "trade_date": ["交收日期", "成交日期", "交易日期", "日期"],  # 日期：涨乐
+    "full_name": ["证券中文全称", "证券全称"],  # 同花顺
+    "commission": ["佣金"],  # 同花顺（涨乐并入「手续费/佣金」-> fee）
+    "transfer_fee": ["过户费"],  # 同花顺 / 涨乐
+    "settlement_fee": ["清算费(b股)", "清算费", "b股清算费"],  # 同花顺 B 股
+    "currency": ["币种", "货币"],  # 同花顺（涨乐无币种列 -> 空）
 }
 
 _ALL_ALIASES: dict[str, str] = {
@@ -376,20 +388,85 @@ def _read_excel(path: Path) -> pd.DataFrame:
     return pd.read_excel(path, header=None, sheet_name=0, engine="openpyxl")
 
 
-def _read_csv(path: Path) -> pd.DataFrame:
-    last_error: Optional[Exception] = None
-    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", "latin-1"):
+_TEXT_ENCODINGS = ("utf-8-sig", "gb18030", "gbk")
+_CSV_DELIMITERS = (",", "\t", ";")
+_TXT_DELIMITERS = ("\t", ",", ";", " ", r"\s{2,}", r"\s+")
+
+
+def _decode_text(path: Path) -> str:
+    """编码探测链：utf-8-sig → gb18030 → gbk（gb18030 为 gbk 超集）。"""
+    raw = path.read_bytes()
+    for encoding in _TEXT_ENCODINGS:
         try:
-            return pd.read_csv(
-                path,
-                header=None,
-                dtype=object,
-                keep_default_na=False,
-                encoding=encoding,
-            )
-        except (UnicodeDecodeError, UnicodeError) as exc:
-            last_error = exc
-    raise ParseError(f"CSV 编码无法识别（已尝试 utf-8/gb18030/gbk 等）：{last_error}")
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ParseError(f"无法识别文件编码（已尝试 utf-8/gb18030/gbk）：{path}")
+
+
+def _count_sep(line: str, candidate: str) -> int:
+    if candidate == " ":
+        # 仅统计「孤立单空格」（两侧都不是空白），避免与多空格对齐混算
+        return len(re.findall(r"(?<!\s) (?!\s)", line))
+    if candidate == r"\s{2,}":
+        return len(re.findall(r"\s{2,}", line))
+    if candidate == r"\s+":
+        return len(re.findall(r"\s+", line))
+    return line.count(candidate)
+
+
+def _detect_delimiter(text: str, candidates: tuple[str, ...]) -> str:
+    """分隔符探测：对前 20 个非空行统计候选分隔符出现次数。
+
+    得分 = 非零行中的最大出现次数（真实分隔符所在的行必然出现最多），
+    并要求候选分隔符覆盖 >= 50% 的采样行；得分相同时按候选顺序优先。
+    """
+    lines = [ln for ln in text.splitlines() if ln.strip()][:20]
+    if not lines:
+        raise ParseError("文件内容为空，无法识别分隔符")
+    scored: list[tuple[float, float, int, str]] = []
+    for candidate in candidates:
+        counts = [_count_sep(ln, candidate) for ln in lines]
+        nonzero = [c for c in counts if c > 0]
+        if not nonzero:
+            continue
+        coverage = len(nonzero) / len(lines)
+        if coverage < 0.5:
+            continue
+        scored.append((max(nonzero), coverage, -candidates.index(candidate), candidate))
+    if not scored:
+        raise ParseError(
+            "无法识别文件分隔符（支持逗号、制表符、分号、空格）"
+        )
+    scored.sort(reverse=True)
+    return scored[0][3]
+
+
+_SPLIT_PATTERNS = {" ": r" ", r"\s{2,}": r"\s{2,}", r"\s+": r"\s+"}
+
+
+def _text_to_frame(text: str, sep: str) -> pd.DataFrame:
+    """按探测出的分隔符把文本切成二维表（object dtype，保留原始字符串）。"""
+    if sep in _SPLIT_PATTERNS:
+        # 单空格分隔时按「恰好一个空格」拆分：连续两个空格即空字段（可无损还原）；
+        # 多空格/任意空白分隔的文本（固定宽度导出）按连续空白折叠拆分。
+        rows = [
+            re.split(_SPLIT_PATTERNS[sep], ln)
+            for ln in text.splitlines()
+            if ln.strip()
+        ]
+    else:
+        reader = csv.reader(io.StringIO(text), delimiter=sep, skipinitialspace=True)
+        rows = [row for row in reader if any(cell.strip() for cell in row)]
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows, dtype=object)
+
+
+def _read_text_table(path: Path, candidates: tuple[str, ...]) -> pd.DataFrame:
+    text = _decode_text(path)
+    separator = _detect_delimiter(text, candidates)
+    return _text_to_frame(text, separator)
 
 
 def _read_table(path: Path) -> pd.DataFrame:
@@ -399,14 +476,16 @@ def _read_table(path: Path) -> pd.DataFrame:
     if suffix == ".xls":
         return _read_excel(path)
     if suffix == ".csv":
-        return _read_csv(path)
-    # 未知扩展名：尽力而为，先按 Excel 再按 CSV 尝试
+        return _read_text_table(path, _CSV_DELIMITERS)
+    if suffix == ".txt":
+        return _read_text_table(path, _TXT_DELIMITERS)
+    # 未知扩展名：尽力而为，先按 Excel 再按文本表尝试
     try:
         return _read_excel(path)
     except ParseError:
         raise
     except Exception:
-        return _read_csv(path)
+        return _read_text_table(path, _TXT_DELIMITERS)
 
 
 def _rows_to_records(raw: pd.DataFrame, source: str) -> list[TradeRecord]:
@@ -423,6 +502,9 @@ def _rows_to_records(raw: pd.DataFrame, source: str) -> list[TradeRecord]:
         raise ParseError(
             f"{source}：缺少必需列：{', '.join(label[m] for m in missing)}"
         )
+    # 「发生金额」仅涨乐版式填充：有发生金额列且无资金余额列时填充；
+    # 同花顺版式不填（cash_amount 保持 0.0，金额口径由资金余额序列推算）。
+    fill_cash_amount = "cash_amount" in columns and "balance" not in columns
 
     records: list[TradeRecord] = []
     for row_no in range(header_row + 1, len(raw)):
@@ -448,10 +530,16 @@ def _rows_to_records(raw: pd.DataFrame, source: str) -> list[TradeRecord]:
                 code=code,
                 name=name,
                 op_type=_classify_op(op_text),
-                qty=_to_float(_cell(row, columns, "qty")),
+                # 涨乐等来源数量带符号（买正卖负），一律取绝对值；方向以摘要/操作列为准
+                qty=abs(_to_float(_cell(row, columns, "qty"))),
                 price=_to_float(_cell(row, columns, "price")),
                 amount=_to_float(_cell(row, columns, "amount")),
                 balance=_to_float(_cell(row, columns, "balance")),
+                cash_amount=(
+                    _to_float(_cell(row, columns, "cash_amount"))
+                    if fill_cash_amount
+                    else 0.0
+                ),
                 fee=fee,
                 stamp_tax=_to_float(_cell(row, columns, "stamp_tax")),
                 commission=_to_float(_cell(row, columns, "commission")),
@@ -474,8 +562,10 @@ def _cell(row: Any, columns: dict[str, int], name: str) -> Any:
 def parse_trades(path: str | os.PathLike[str]) -> list[TradeRecord]:
     """解析交割单文件，返回 ``TradeRecord`` 列表。
 
-    支持 .xlsx（openpyxl）、.xls（xlrd，尽力而为）、.csv（utf-8/gbk 自动尝试）。
-    文件不存在、不可解析或缺少必需列时抛出 ``ParseError``（中文信息）。
+    支持同花顺、涨乐财富通等券商版式；文件格式 .xlsx（openpyxl）、
+    .xls（xlrd，尽力而为）、.csv/.txt（自动探测逗号/制表符/分号/空格分隔符，
+    编码链 utf-8-sig → gb18030 → gbk），列名经券商无关同义词表自动映射。
+    文件不存在、不可解析、分隔符/编码无法识别或缺少必需列时抛出 ``ParseError``。
     """
     file_path = Path(path)
     if not file_path.exists():

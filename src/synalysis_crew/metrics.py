@@ -6,7 +6,8 @@
 
 v2 口径（与 requirements-v2.md 对齐）：
 - ``amount``：按 parser 落地契约为「成交金额」（恒正）；本模块以「资金余额差额」
-  （交易后资金余额 - 上一笔资金余额）作为现金流的权威信号，``amount`` 仅在余额缺失时兜底，
+  （交易后资金余额 - 上一笔资金余额）作为现金流的权威信号（余额缺失时优先按
+  ``cash_amount`` 发生金额、其次按操作类型估计，见下方「流水模式」），
   因此买入费用入成本、卖出费用扣净额、净转入等口径自动成立；
 - 费用口径：``fee`` 含「手续费+其他杂费」，``transfer_fee`` 含「过户费+清算费(B股)」，
   总交易成本 = fee + stamp_tax + commission + transfer_fee（佣金与手续费取 max 防重复）；
@@ -40,11 +41,22 @@ v2 口径（与 requirements-v2.md 对齐）：
 - M6：首行「证券转银行」按其出金额计入现金流转（net_transfer/gross_withdraw/
   月转账），期初资金 = 余额 + 出金额；
 - 区间口径：期初资金 != 0 或期初有持仓（文件内先卖后买）时 ``is_partial=True``。
+- 流水模式（无余额文件，如涨乐财富通导出 CSV）：``_collect`` 后所有记录 balance
+  均为 None（鸭子类型）或均 ≤ 0 且存在非零 ``cash_amount``（parser 落地：无余额列时
+  balance 填 0.0、cash_amount 填「发生金额」）即 ``flow_mode=True``；现金从 0.0 起
+  按每条记录 ``cash_amount``（发生金额，带符号：买入为负、卖出为正、转账±、红利/
+  利息+；parser 未落地时 getattr 兜底为 None）累加，``_estimate_cash_delta`` 优先
+  使用 cash_amount（0.0 视为未提供，回退操作类型估算）。期初资金按 0.0 计
+  （期初资金/持仓未知，按文件区间口径），``meta.is_partial=True``，并新增
+  ``meta.balance_source``："flow"（无余额文件）/ "balance"（有余额文件）；
+  出入金/净转入、FIFO 闭环、胜率、翻倍/腰斩、return_curve 等其余指标逻辑不变，
+  仅现金来源切换。
 
 固定 JSON Schema：::
 
     {
-      "meta": {is_partial, start_date, end_date, calendar_days, active_trading_days, generated_at},
+      "meta": {is_partial, balance_source, start_date, end_date, calendar_days,
+               active_trading_days, generated_at},
       "account": {initial_balance, ending_balance, net_transfer_in,
                   gross_deposit, gross_withdraw, opening_asset_value,
                   total_return_rate, total_return_rate_net, annualized_return_rate,
@@ -70,6 +82,9 @@ v2 口径（与 requirements-v2.md 对齐）：
 - 收益率/胜率/集中度等比率以小数存储（如 0.1234 = 12.34%）；最大回撤为正值（相对峰值跌幅）；
 - ``total_return_rate`` 主口径 = 逐日 TWR 最终累计收益率 R（1.0），出入金不影响
   收益率本身；无任何有效日收益（如全部起始日资产 ≤ 0）时输出 None。
+- ``meta.balance_source``：现金链数据来源——"balance"（资金余额列权威）/ "flow"
+  （无余额流水模式：现金从 0 起按 ``cash_amount`` 累加，期初资金/持仓未知，
+  ``is_partial`` 恒为 True）。
 - ``total_return_rate_net`` 为对照口径（期初资产基准简单收益率）：
   (期末资产 − A0 − 净转入) / A0；A0 = 0（完整历史）时退化为
   (期末资产 − 累计入金) / 累计入金。
@@ -335,6 +350,7 @@ class _Rec:
     transfer_fee: float
     date: date
     idx: int
+    cash_amount: Optional[float] = None  # 「发生金额」带符号；无余额流水模式现金链来源
 
     @property
     def gross(self) -> float:
@@ -397,6 +413,7 @@ def _collect(trades: Sequence[Any]) -> List[_Rec]:
     for index, trade in enumerate(trades):
         try:
             balance_raw = getattr(trade, "balance", None)
+            cash_raw = getattr(trade, "cash_amount", None)
             recs.append(
                 _Rec(
                     op=_norm_op(getattr(trade, "op_type", None)),
@@ -406,6 +423,7 @@ def _collect(trades: Sequence[Any]) -> List[_Rec]:
                     price=_num(getattr(trade, "price", 0.0)),
                     amount=_num(getattr(trade, "amount", 0.0)),
                     balance=None if balance_raw is None else _num(balance_raw),
+                    cash_amount=None if cash_raw is None else _num(cash_raw),
                     fee=_num(getattr(trade, "fee", 0.0)),
                     stamp_tax=_num(getattr(trade, "stamp_tax", 0.0)),
                     commission=_num(getattr(trade, "commission", 0.0)),
@@ -422,7 +440,12 @@ def _collect(trades: Sequence[Any]) -> List[_Rec]:
 
 
 def _estimate_cash_delta(rec: _Rec) -> float:
-    """余额缺失时按操作类型估算「发生金额」（买入为负、卖出为正）。"""
+    """余额缺失时估计现金增量：有 ``cash_amount``（发生金额，带符号）时优先——
+    流水模式权威信号；否则按操作类型估算（买入为负、卖出为正、转账±、红利/利息+）。
+    cash_amount == 0.0 视为未提供（parser 对同花顺版式留 0.0，金额口径按余额推算），
+    继续按操作类型估算，避免把默认值误当权威信号。"""
+    if rec.cash_amount is not None and abs(rec.cash_amount) > _EPS:
+        return rec.cash_amount
     if rec.op == OP_BUY:
         return -(rec.gross + rec.cost_fields)
     if rec.op == OP_SELL:
@@ -437,7 +460,7 @@ def _estimate_cash_delta(rec: _Rec) -> float:
 
 
 def _prescan_unmatched(
-    recs: Sequence[_Rec], initial_balance: float
+    recs: Sequence[_Rec], initial_balance: float, flow_mode: bool = False
 ) -> Tuple[Dict[str, float], float]:
     """v2.1 轻量 FIFO 预扫描：逐股计算「期初持仓未配对卖出额」（变现价值）。
 
@@ -452,7 +475,7 @@ def _prescan_unmatched(
     unmatched: Dict[str, float] = defaultdict(float)
     prev_balance = initial_balance
     for rec in recs:
-        if rec.balance is not None:
+        if not flow_mode and rec.balance is not None:
             cash_delta = rec.balance - prev_balance
             prev_balance = rec.balance
         else:
@@ -666,6 +689,7 @@ def _empty_result() -> MetricsResult:
         {
             "meta": {
                 "is_partial": False,
+                "balance_source": "balance",
                 "start_date": None,
                 "end_date": None,
                 "calendar_days": 0,
@@ -771,29 +795,44 @@ def compute_metrics(
     if not recs:
         return _empty_result()
 
-    # ---- 期初资金（资金余额口径）：首笔交易前的余额 ----
-    first = recs[0]
-    if first.balance is None:
+    # ---- 流水模式检测（无余额文件，如涨乐财富通导出 CSV）----
+    # 1) 契约/鸭子类型：balance 字段缺失（None）；
+    # 2) parser 实际落地：无余额列时 balance 填 0.0、cash_amount 填发生金额（非零），
+    #    同花顺版式 balance 为真实余额、cash_amount 恒 0.0（视为未提供）。
+    flow_mode = all(rec.balance is None for rec in recs) or (
+        all(rec.balance is not None and abs(rec.balance) <= _EPS for rec in recs)
+        and any(
+            rec.cash_amount is not None and abs(rec.cash_amount) > _EPS
+            for rec in recs
+        )
+    )
+
+    # ---- 期初资金：余额口径为首笔交易前余额；流水模式从 0 起（期初资金未知）----
+    if flow_mode:
         initial_balance = 0.0
-    elif first.op == OP_TRANSFER_IN:
-        # 首行银行转证券：完整历史，视为从 0 开始
-        initial_balance = 0.0
-    elif first.op == OP_TRANSFER_OUT:
-        # M6：首行证券转银行——该笔出金必须计入现金流转（net_transfer/
-        # gross_withdraw/月转账），期初资金 = 余额 + 出金额。出金额以记录
-        # 的成交金额字段为代理（parser 未暴露「发生金额」列；同花顺导出若
-        # 成交金额为空则无法从契约字段重建，保持按余额反推）。
-        out_amount = first.amount if first.amount > _EPS else 0.0
-        initial_balance = first.balance + out_amount
     else:
-        initial_balance = first.balance - _estimate_cash_delta(first)
+        first = recs[0]
+        if first.balance is None:
+            initial_balance = 0.0
+        elif first.op == OP_TRANSFER_IN:
+            # 首行银行转证券：完整历史，视为从 0 开始
+            initial_balance = 0.0
+        elif first.op == OP_TRANSFER_OUT:
+            # M6：首行证券转银行——该笔出金必须计入现金流转（net_transfer/
+            # gross_withdraw/月转账），期初资金 = 余额 + 出金额。出金额以记录
+            # 的成交金额字段为代理（parser 未暴露「发生金额」列；同花顺导出若
+            # 成交金额为空则无法从契约字段重建，保持按余额反推）。
+            out_amount = first.amount if first.amount > _EPS else 0.0
+            initial_balance = first.balance + out_amount
+        else:
+            initial_balance = first.balance - _estimate_cash_delta(first)
 
     start_date = recs[0].date
     end_date = recs[-1].date
 
     # ---- v2.1 期初持仓预扫描：逐股未配对卖出额 = 期初持仓变现价值（合成持仓） ----
     unmatched_by_stock, unmatched_sell_amount = _prescan_unmatched(
-        recs, initial_balance
+        recs, initial_balance, flow_mode
     )
     opening_asset_value = initial_balance + unmatched_sell_amount
 
@@ -880,7 +919,8 @@ def compute_metrics(
         return sum(state.holding_cost() for state in stocks.values())
 
     # ---- v2.1 逐日 TWR 模拟状态 ----
-    # 现金以资金余额为权威（缺失时按估计增量续链）；持仓估值价 = 最近成交价；
+    # 现金以资金余额为权威（缺失时按估计增量续链；流水模式从 0 起按发生金额累加）；
+    # 持仓估值价 = 最近成交价；
     # 合成持仓（期初持仓变现价值）从模拟开始计入期初资产，未配对卖出时同步扣减。
     synthetic_remaining: Dict[str, float] = dict(unmatched_by_stock)
     last_price: Dict[str, float] = {}
@@ -959,17 +999,19 @@ def compute_metrics(
             day_flow = 0.0
 
         cash_delta = (
-            rec.balance - prev_balance
-            if rec.balance is not None
-            else _estimate_cash_delta(rec)
+            _estimate_cash_delta(rec)
+            if flow_mode or rec.balance is None
+            else rec.balance - prev_balance
         )
-        # 现金：资金余额为权威，缺失时按估计增量续链
-        if rec.balance is not None:
+        # 现金：资金余额为权威；缺失或流水模式时按估计增量续链（流水模式 = cash_amount 从 0 起累加）
+        if flow_mode or rec.balance is None:
+            cash += cash_delta
+            last_balance = cash
+            balances.append(cash)
+        else:
             cash = rec.balance
             last_balance = rec.balance
             balances.append(rec.balance)
-        else:
-            cash += _estimate_cash_delta(rec)
         total_cost += rec.cost_fields
 
         if rec.code:
@@ -1434,8 +1476,13 @@ def compute_metrics(
     return MetricsResult(
         {
             "meta": {
-                "is_partial": abs(initial_balance) > _EPS
-                or any(state.pre_qty > _EPS for state in stocks.values()),
+                "is_partial": True
+                if flow_mode
+                else (
+                    abs(initial_balance) > _EPS
+                    or any(state.pre_qty > _EPS for state in stocks.values())
+                ),
+                "balance_source": "flow" if flow_mode else "balance",
                 "start_date": start_date.isoformat(),
                 "end_date": end_date.isoformat(),
                 "calendar_days": span_days + 1,

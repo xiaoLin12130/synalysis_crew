@@ -360,7 +360,7 @@ def test_public_mode_analysis_no_record(client, iso_dir, no_price_fetch, monkeyp
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", ["evil.txt", "trades.pdf", "noext"])
+@pytest.mark.parametrize("name", ["trades.pdf", "evil.docx", "noext"])
 def test_extension_rejected_400(client, name):
     resp = client.post(
         "/api/analyze",

@@ -55,7 +55,7 @@ app.add_middleware(
 UPLOAD_DIR = ROOT / ".tmp" / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-ALLOWED_SUFFIXES = {".xlsx", ".xls", ".csv"}  # 支持的上传格式
+ALLOWED_SUFFIXES = {".xlsx", ".xls", ".csv", ".txt"}  # 支持的上传格式（同花顺导出类型）
 MAX_UPLOAD_MB = 50  # 上传大小上限（默认 50MB）
 JOB_TTL_SECONDS = 3600  # 终态任务（done/error）超过 1 小时移除
 MAX_JOBS = 50  # JOBS 字典保留的终态任务上限（保留最近 N 条）

@@ -87,9 +87,11 @@ def T(
     stamp_tax: float = 0.0,
     commission: float = 0.0,
     transfer_fee: float = 0.0,
+    cash_amount: object = None,
 ) -> TradeRecord:
-    """构造一条交割记录（amount 按 parser 契约为「成交金额」，balance 为交易后资金余额）。"""
-    return TradeRecord(
+    """构造一条交割记录（amount 按 parser 契约为「成交金额」，balance 为交易后资金余额；
+    cash_amount 为「发生金额」（带符号），None 表示不设置——流水模式测试传实际值）。"""
+    rec = TradeRecord(
         code=code,
         name=name,
         op_type=_op(op),
@@ -103,6 +105,9 @@ def T(
         transfer_fee=transfer_fee,
         trade_date=trade_date,
     )
+    if cash_amount is not None:
+        rec.cash_amount = cash_amount
+    return rec
 
 
 @pytest.fixture()
@@ -181,6 +186,7 @@ def test_full_history_hand_check_account_and_trading(no_price_fetch):
     assert m["meta"]["end_date"] == "2024-04-25"
     assert m["meta"]["calendar_days"] == 116
     assert m["meta"]["active_trading_days"] == 12
+    assert m["meta"]["balance_source"] == "balance"
 
     a = m["account"]
     assert a["initial_balance"] == 0.0
@@ -1117,6 +1123,7 @@ def test_empty_result_has_v2_fields():
     m = compute_metrics([])
     assert m["meta"]["is_partial"] is False
     assert m["meta"]["start_date"] is None
+    assert m["meta"]["balance_source"] == "balance"
     assert m["account"]["initial_balance"] == 0.0
     assert m["account"]["total_return_rate"] is None
     assert m["pnl"]["win_rate"] is None
@@ -1182,6 +1189,10 @@ def test_duck_typed_records_without_balance():
     # 无资金余额且无入金记录：A0=0 且 Σd=0，收益率未定义
     assert m["pnl"]["return_curve"][0]["return_rate"] is None
     assert m["account"]["total_return_rate"] is None
+    # 无余额字段的鸭子类型输入 → 流水模式：期初资金 0、期初口径部分数据
+    assert m["meta"]["is_partial"] is True
+    assert m["meta"]["balance_source"] == "flow"
+    assert m["account"]["initial_balance"] == 0.0
 
 
 def test_parser_contract_records_work_with_metrics(no_price_fetch):
@@ -1194,3 +1205,162 @@ def test_parser_contract_records_work_with_metrics(no_price_fetch):
     assert len(m["trades"]) == 6
     assert len(m["pnl"]["return_curve"]) == 4
     assert m["account"]["total_return_rate"] == pytest.approx(0.006, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# 流水模式（无余额文件，涨乐财富通「发生金额」口径）
+# ---------------------------------------------------------------------------
+
+
+def _flow_mode_trades() -> list[TradeRecord]:
+    """无余额手算场景（balance=None + cash_amount 带符号发生金额）。
+    现金链：0 → 10000 → 8990 → 10485 → 10585 → 8585；
+    逐日 TWR：r1 跳过（期初资产 0）→ -0.001 → +495/9990 → +100/10485 → 0，
+    累计 R = 10585/10000 − 1 = 0.0585。"""
+    return [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, None, date(2024, 1, 2), cash_amount=10000),
+        T("A", "A股", "BUY", 100, 10, 1000, None, date(2024, 1, 3),
+          fee=10, commission=10, cash_amount=-1010),
+        T("A", "A股", "SELL", 100, 15, 1500, None, date(2024, 1, 5),
+          fee=5, cash_amount=1495),
+        T("", "", "DIVIDEND", 0, 0, 0, None, date(2024, 1, 8), cash_amount=100),
+        T("", "", "SEC_TO_BANK", 0, 0, 0, None, date(2024, 1, 10),
+          cash_amount=-2000),
+    ]
+
+
+def test_flow_mode_hand_check(no_price_fetch):
+    """流水模式手算：余额全 None → flow_mode；现金从 0 起按发生金额累加，
+    FIFO/费用/TWR 逻辑与余额模式一致（仅现金来源切换）。"""
+    m = compute_metrics(_flow_mode_trades())
+
+    # 口径：期初资金 0、期初未知 → is_partial=True、balance_source="flow"
+    assert m["meta"]["is_partial"] is True
+    assert m["meta"]["balance_source"] == "flow"
+    assert m["meta"]["start_date"] == "2024-01-02"
+    assert m["meta"]["end_date"] == "2024-01-10"
+
+    a = m["account"]
+    assert a["initial_balance"] == 0.0
+    assert a["ending_balance"] == pytest.approx(8585.0, abs=0.01)
+    assert a["net_transfer_in"] == pytest.approx(8000.0, abs=0.01)
+    assert a["gross_deposit"] == pytest.approx(10000.0, abs=0.01)
+    assert a["gross_withdraw"] == pytest.approx(2000.0, abs=0.01)
+    assert a["opening_asset_value"] == 0.0
+    # 买入费用入成本（-现金=1010）、卖出费用扣净额（发生金额=1495）
+    assert a["realized_pnl"] == pytest.approx(485.0, abs=0.01)
+    assert a["total_cost"] == pytest.approx(15.0, abs=0.01)
+    # TWR：出入金/分红不影响累计逻辑，R = 10585/10000 − 1
+    assert a["total_return_rate"] == pytest.approx(0.0585, abs=1e-6)
+    # 对照口径（A0=0 → 累计入金基准）：(8585 − 10000) / 10000
+    assert a["total_return_rate_net"] == pytest.approx(-0.1415, abs=1e-6)
+
+    p = m["pnl"]
+    assert p["realized_pnl"] == pytest.approx(485.0, abs=0.01)
+    assert p["win_count"] == 1
+    assert p["loss_count"] == 0
+    assert p["win_rate"] == pytest.approx(1.0, abs=1e-4)
+    assert p["double_count"] == 0
+    assert p["halved_count"] == 0
+    assert p["monthly_pnl"] == [{"month": "2024-01", "pnl": 485.0}]
+    assert p["return_curve"] == [
+        {"month": "2024-01", "date": "2024-01-10", "return_rate": 0.0585},
+    ]
+
+    assert m["trades"] == [
+        {
+            "code": "A",
+            "name": "A股",
+            "buy_qty": 100.0,
+            "buy_amount": 1010.0,
+            "sell_qty": 100.0,
+            "sell_amount": 1495.0,
+            "pnl": 485.0,
+            "holding_days": 3,
+            "start_date": "2024-01-03",
+            "end_date": "2024-01-05",
+            "status": "closed",
+        }
+    ]
+    assert m["behavior"]["special_operations"]["dividend"] == {
+        "count": 1,
+        "amount": pytest.approx(100.0),
+    }
+
+
+def test_flow_mode_equivalent_to_balance_mode(no_price_fetch):
+    """同一组交易分别用「发生金额流水」与「资金余额」表达 → 已实现盈亏、
+    完整交易、净转入、TWR 完全一致（流水模式仅切换现金来源）。"""
+    balance_trades = [
+        T("", "", "BANK_TO_SEC", 0, 0, 0, 10000, date(2024, 1, 2)),
+        T("A", "A股", "BUY", 100, 10, 1000, 8990, date(2024, 1, 3),
+          fee=10, commission=10),
+        T("A", "A股", "SELL", 100, 15, 1500, 10485, date(2024, 1, 5), fee=5),
+        T("", "", "DIVIDEND", 0, 0, 100, 10585, date(2024, 1, 8)),
+        T("", "", "SEC_TO_BANK", 0, 0, 0, 8585, date(2024, 1, 10)),
+    ]
+    m_bal = compute_metrics(balance_trades)
+    m_flow = compute_metrics(_flow_mode_trades())
+
+    assert m_bal["meta"]["balance_source"] == "balance"
+    for key in ("realized_pnl", "net_transfer_in", "gross_deposit", "gross_withdraw",
+                "total_return_rate", "total_return_rate_net", "ending_balance"):
+        assert m_flow["account"][key] == pytest.approx(
+            m_bal["account"][key], abs=1e-9
+        ), key
+    assert m_flow["trades"] == m_bal["trades"]
+    assert m_flow["pnl"]["monthly_pnl"] == m_bal["pnl"]["monthly_pnl"]
+    assert m_flow["pnl"]["return_curve"] == m_bal["pnl"]["return_curve"]
+    assert m_flow["pnl"]["realized_pnl"] == m_bal["pnl"]["realized_pnl"]
+
+
+def test_flow_mode_parser_contract_zero_balance_filled_cash_amount(no_price_fetch):
+    """parser 实际落地契约：涨乐 CSV 无余额列 → balance=0.0、cash_amount=发生金额
+    （非零），应识别为流水模式（而非把 0.0 余额当权威）。"""
+    trades = [
+        T("A", "A股", "BUY", 100, 10, 1000, 0.0, date(2024, 1, 2),
+          fee=10, commission=10, cash_amount=-1010),
+        T("A", "A股", "SELL", 100, 12, 1200, 0.0, date(2024, 1, 4),
+          fee=5, cash_amount=1195),
+    ]
+    m = compute_metrics(trades)
+    assert m["meta"]["is_partial"] is True
+    assert m["meta"]["balance_source"] == "flow"
+    assert m["account"]["initial_balance"] == 0.0
+    assert m["account"]["ending_balance"] == pytest.approx(185.0, abs=0.01)
+    assert m["pnl"]["realized_pnl"] == pytest.approx(185.0, abs=0.01)
+    assert m["trades"][0]["buy_amount"] == pytest.approx(1010.0, abs=0.01)
+    assert m["trades"][0]["sell_amount"] == pytest.approx(1195.0, abs=0.01)
+
+
+def _rec_delta(
+    op: str, qty: float, price: float, amount: float,
+    cash_amount=None, fee: float = 0.0, commission: float = 0.0,
+) -> float:
+    return metrics_module._estimate_cash_delta(
+        metrics_module._Rec(
+            op=op, code="", name="", qty=qty, price=price, amount=amount,
+            balance=None, fee=fee, stamp_tax=0.0, commission=commission,
+            transfer_fee=0.0, date=date(2024, 1, 2), idx=0,
+            cash_amount=cash_amount,
+        )
+    )
+
+
+def test_estimate_cash_delta_prefers_cash_amount():
+    """发生金额优先：买入负、卖出正、转账±、红利+；0.0 视为未提供（同花顺版式
+    parser 留 0.0），回退按操作类型估算。"""
+    # 注：_Rec.op 为内部规范值（_collect 已做 _norm_op），测试直接用小写
+    # 买入：发生金额含费用；缺省时按 成交金额+费用 估算（两者一致）
+    assert _rec_delta("buy", 100, 10, 1000, cash_amount=-1010, fee=10, commission=10) == -1010
+    assert _rec_delta("buy", 100, 10, 1000, cash_amount=None, fee=10, commission=10) == -1010
+    # 买入发生金额恰为 0.0 → 不当作权威，回退估算
+    assert _rec_delta("buy", 100, 10, 1000, cash_amount=0.0, fee=10, commission=10) == -1010
+    # 卖出：发生金额为净额（扣费用）
+    assert _rec_delta("sell", 100, 15, 1500, cash_amount=1495, fee=5) == 1495
+    assert _rec_delta("sell", 100, 15, 1500, cash_amount=None, fee=5) == 1495
+    # 转账±与红利+均按发生金额
+    assert _rec_delta("transfer_in", 0, 0, 5000, cash_amount=5000) == 5000
+    assert _rec_delta("transfer_in", 0, 0, 5000, cash_amount=-3000) == -3000
+    assert _rec_delta("dividend", 0, 0, 100, cash_amount=200) == 200
+    assert _rec_delta("interest", 0, 0, 0, cash_amount=12.5) == 12.5
